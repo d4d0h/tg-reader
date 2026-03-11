@@ -418,7 +418,7 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
 async function handleGetChatsConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
   try {
     const { results } = await env.DB.prepare(
-      `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = ? ORDER BY updated_at DESC`
+      `SELECT tg_chat_id, chat_name, sync, ai_monitor, updated_at FROM chat_config WHERE account_id = ? ORDER BY updated_at DESC`
     ).bind(accountId).all();
     return json(results);
   } catch (err) {
@@ -439,11 +439,17 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
     return json({ ok: false, error: `sync must be 'include' or 'exclude'` }, 400);
   }
 
+  const aiMonitor = typeof b.ai_monitor === 'number' ? (b.ai_monitor ? 1 : 0) : null;
+
   try {
     await env.DB.prepare(`
-      INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at) VALUES (?, ?, ?, ?, unixepoch())
-      ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET chat_name = excluded.chat_name, sync = excluded.sync, updated_at = unixepoch()
-    `.trim()).bind(accountId, b.tg_chat_id, b.chat_name ?? null, b.sync).run();
+      INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, ai_monitor, updated_at) VALUES (?, ?, ?, ?, COALESCE(?, 0), unixepoch())
+      ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET
+        chat_name  = excluded.chat_name,
+        sync       = excluded.sync,
+        ai_monitor = CASE WHEN ? IS NOT NULL THEN excluded.ai_monitor ELSE chat_config.ai_monitor END,
+        updated_at = unixepoch()
+    `.trim()).bind(accountId, b.tg_chat_id, b.chat_name ?? null, b.sync, aiMonitor, aiMonitor).run();
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /chats/config] DB error', err);
@@ -619,6 +625,173 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 }
 
 // ---------------------------------------------------------------------------
+// Tasks handlers
+// ---------------------------------------------------------------------------
+
+async function handleGetTasks(request: Request, env: Env, accountId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const status = url.searchParams.get('status') ?? 'open';
+  const chatId = url.searchParams.get('chat_id') ?? null;
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 100);
+
+  const SQL = `
+    SELECT * FROM tasks
+    WHERE account_id = ?
+      AND (status = ? OR ? = 'all')
+      AND (tg_chat_id = ? OR ? IS NULL)
+    ORDER BY created_at DESC
+    LIMIT ?
+  `.trim();
+
+  try {
+    const { results } = await env.DB.prepare(SQL).bind(accountId, status, status, chatId, chatId, limit).all();
+    console.log(`[GET /tasks] account=${accountId} status=${status} count=${results.length}`);
+    return json(results);
+  } catch (err) {
+    console.error('[GET /tasks] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handlePatchTask(taskId: string, request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  const VALID_TASK_STATUSES = ['open', 'done', 'dismissed'] as const;
+  if (b.status !== undefined && !VALID_TASK_STATUSES.includes(b.status as typeof VALID_TASK_STATUSES[number])) {
+    return json({ ok: false, error: `status must be one of: ${VALID_TASK_STATUSES.join(', ')}` }, 400);
+  }
+
+  const sets: string[] = ['updated_at = unixepoch()'];
+  const binds: (string | number | null)[] = [];
+  if (b.status !== undefined) { sets.push('status = ?'); binds.push(b.status as string); }
+  if (b.external_ids !== undefined) { sets.push('external_ids = ?'); binds.push(JSON.stringify(b.external_ids)); }
+  binds.push(accountId, parseInt(taskId, 10));
+
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE tasks SET ${sets.join(', ')} WHERE account_id = ? AND id = ?`
+    ).bind(...binds).run();
+    if (result.meta.rows_written === 0) return json({ ok: false, error: 'Not found' }, 404);
+    console.log(`[PATCH /tasks/${taskId}] account=${accountId}`);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[PATCH /tasks] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI monitor — extracts tasks from monitored chats (runs on cron)
+// ---------------------------------------------------------------------------
+
+interface MonitoredMessage {
+  id: number;
+  tg_message_id: number;
+  sender_first_name: string | null;
+  sender_username: string | null;
+  text: string;
+  sent_at: number;
+}
+
+interface ExtractedTask {
+  title: string;
+  description?: string;
+  due_date?: string | null;
+  source_message_id?: number;
+}
+
+async function processMonitoredChat(env: Env, accountId: string, tgChatId: string): Promise<void> {
+  const { results: messages } = await env.DB.prepare(`
+    SELECT id, tg_message_id, sender_first_name, sender_username, text, sent_at
+    FROM messages
+    WHERE account_id = ? AND tg_chat_id = ? AND ai_analyzed_at IS NULL
+      AND text IS NOT NULL AND text != ''
+    ORDER BY sent_at ASC
+    LIMIT 20
+  `.trim()).bind(accountId, tgChatId).all<MonitoredMessage>();
+
+  if (messages.length === 0) return;
+
+  console.log(`[ai-monitor] account=${accountId} chat=${tgChatId} messages=${messages.length}`);
+
+  const msgList = messages.map(m => ({
+    id: m.tg_message_id,
+    sender: m.sender_first_name ?? m.sender_username ?? 'unknown',
+    text: m.text,
+    sent_at: m.sent_at,
+  }));
+
+  const prompt = `Extract action items and tasks from these Telegram messages. Return JSON only.
+Format: {"tasks": [{"title": "brief action max 200 chars", "description": "optional context", "due_date": "YYYY-MM-DD or null", "source_message_id": <id from input>}]}
+Only extract concrete tasks requiring follow-up. If none, return {"tasks": []}.
+
+Messages:
+${JSON.stringify(msgList)}`;
+
+  let extractedTasks: ExtractedTask[] = [];
+  try {
+    const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct' as Parameters<typeof env.AI.run>[0], {
+      messages: [
+        { role: 'system', content: 'You are a task extraction assistant. Always respond with valid JSON only, no other text.' },
+        { role: 'user', content: prompt },
+      ],
+    }) as { response: string };
+
+    const parsed = JSON.parse(aiResponse.response) as { tasks?: ExtractedTask[] };
+    extractedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  } catch (err) {
+    console.error(`[ai-monitor] AI error account=${accountId} chat=${tgChatId}:`, err instanceof Error ? err.message : String(err));
+    // Still mark messages analyzed so we don't retry endlessly on AI errors
+  }
+
+  const stmts: D1PreparedStatement[] = [];
+
+  for (const t of extractedTasks) {
+    if (!t.title?.trim()) continue;
+    stmts.push(env.DB.prepare(`
+      INSERT INTO tasks (account_id, tg_chat_id, source_message_id, title, description, due_date)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `.trim()).bind(
+      accountId, tgChatId,
+      t.source_message_id ?? null,
+      t.title.slice(0, 200),
+      t.description ?? null,
+      t.due_date ?? null,
+    ));
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  for (const m of messages) {
+    stmts.push(env.DB.prepare(`UPDATE messages SET ai_analyzed_at = ? WHERE id = ?`).bind(now, m.id));
+  }
+
+  try {
+    await env.DB.batch(stmts);
+    console.log(`[ai-monitor] extracted=${extractedTasks.length} marked=${messages.length} account=${accountId} chat=${tgChatId}`);
+  } catch (err) {
+    console.error('[ai-monitor] DB batch error:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function runAiMonitor(env: Env): Promise<void> {
+  const { results: monitored } = await env.DB.prepare(
+    `SELECT account_id, tg_chat_id FROM chat_config WHERE ai_monitor = 1`
+  ).all<{ account_id: string; tg_chat_id: string }>();
+
+  if (monitored.length === 0) {
+    console.log('[ai-monitor] no monitored chats');
+    return;
+  }
+
+  console.log(`[ai-monitor] processing ${monitored.length} monitored chats`);
+  for (const { account_id, tg_chat_id } of monitored) {
+    await processMonitoredChat(env, account_id, tg_chat_id);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP (Model Context Protocol) — Streamable HTTP transport, spec 2024-11-05
 // ---------------------------------------------------------------------------
 
@@ -694,6 +867,18 @@ const MCP_TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    name: 'tasks',
+    description: 'List AI-extracted action items and tasks from monitored Telegram chats. Tasks are automatically identified from message content by an AI cron job. Use this to check what follow-up items have been extracted, or to find tasks from a specific chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: 'Filter by status: open, done, dismissed, or all. Default: open.' },
+        chat_id: { type: 'string', description: 'Filter to a specific chat ID.' },
+        limit: { type: 'number', description: 'Max results, default 20.' },
+      },
+    },
+  },
 ];
 
 async function dispatchMcpTool(
@@ -762,6 +947,17 @@ async function dispatchMcpTool(
     params.set('limit', String(limit));
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId);
+    return await res.json();
+  }
+
+  if (name === 'tasks') {
+    const params = new URLSearchParams();
+    params.set('status', typeof args.status === 'string' ? args.status : 'open');
+    if (typeof args.chat_id === 'string') params.set('chat_id', args.chat_id);
+    const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 100);
+    params.set('limit', String(limit));
+    const req = new Request(`https://internal/tasks?${params.toString()}`);
+    const res = await handleGetTasks(req, env, accountId);
     return await res.json();
   }
 
@@ -940,6 +1136,15 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleBackfillProgress(request, env, accountId);
   }
 
+  if (method === 'GET' && pathname === '/tasks') {
+    return handleGetTasks(request, env, accountId);
+  }
+
+  const taskMatch = pathname.match(/^\/tasks\/(\d+)$/);
+  if (method === 'PATCH' && taskMatch) {
+    return handlePatchTask(taskMatch[1], request, env, accountId);
+  }
+
   if (method === 'POST' && pathname === '/mcp') {
     return handleMcp(request, env, accountId);
   }
@@ -1049,6 +1254,8 @@ async function scheduled(
 ): Promise<void> {
   if (event.cron === '0 4 1 * *') {
     await runStorageCheck(env);
+  } else if (event.cron === '*/10 * * * *') {
+    await runAiMonitor(env);
   } else {
     await runBackup(env);
   }

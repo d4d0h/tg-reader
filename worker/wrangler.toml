@@ -11,5 +11,8 @@ database_id = "430ffb40-988f-4929-bde2-8b2be617de3d"
 binding = "BACKUP_BUCKET"
 bucket_name = "tg-reader-backup"
 
+[ai]
+binding = "AI"
+
 [triggers]
-crons = ["0 3 * * *", "0 4 1 * *"]  # daily backup at 3am UTC, monthly storage check at 4am on 1st
+crons = ["0 3 * * *", "0 4 1 * *", "*/10 * * * *"]  # daily backup, monthly storage check, AI task extraction every 10 min

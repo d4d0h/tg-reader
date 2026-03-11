@@ -32,6 +32,7 @@ CREATE TABLE messages (
   is_deleted           INTEGER DEFAULT 0,     -- 1 if observed as deleted
   deleted_at           INTEGER,               -- Unix epoch seconds, NULL if not deleted
   indexed_at           INTEGER DEFAULT (unixepoch()),
+  ai_analyzed_at       INTEGER,               -- Unix epoch seconds; NULL = not yet analyzed for tasks
   UNIQUE(account_id, tg_chat_id, tg_message_id)
 );
 
@@ -40,6 +41,7 @@ CREATE TABLE chat_config (
   tg_chat_id   TEXT NOT NULL,
   chat_name    TEXT,
   sync         TEXT CHECK(sync IN ('include', 'exclude')) DEFAULT 'include',
+  ai_monitor   INTEGER DEFAULT 0,   -- 1 = extract tasks from this chat via AI cron
   updated_at   INTEGER DEFAULT (unixepoch()),
   PRIMARY KEY (account_id, tg_chat_id)
 );
@@ -76,6 +78,20 @@ CREATE TABLE backfill_state (
   PRIMARY KEY (account_id, tg_chat_id)
 );
 
+CREATE TABLE tasks (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id        TEXT NOT NULL DEFAULT 'primary',
+  tg_chat_id        TEXT NOT NULL,
+  source_message_id INTEGER,               -- tg_message_id of the originating message
+  title             TEXT NOT NULL,
+  description       TEXT,
+  status            TEXT CHECK(status IN ('open', 'done', 'dismissed')) DEFAULT 'open',
+  due_date          TEXT,                  -- ISO date string (YYYY-MM-DD) if AI detected one
+  external_ids      TEXT DEFAULT '{}',     -- JSON: {"linear": "TGR-42", "notion": "abc123"}
+  created_at        INTEGER DEFAULT (unixepoch()),
+  updated_at        INTEGER DEFAULT (unixepoch())
+);
+
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
@@ -88,6 +104,8 @@ CREATE INDEX idx_sent_at   ON messages(account_id, sent_at);
 CREATE INDEX idx_sender_id ON messages(account_id, sender_id);
 
 CREATE INDEX idx_contacts_username ON contacts(account_id, username);
+CREATE INDEX idx_tasks_account    ON tasks(account_id, status, created_at DESC);
+CREATE INDEX idx_messages_unanalyzed ON messages(account_id, tg_chat_id) WHERE ai_analyzed_at IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- FTS5 virtual table
@@ -129,3 +147,13 @@ END;
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO global_config VALUES ('sync_mode', 'all');
+
+-- ---------------------------------------------------------------------------
+-- Migrations (feature/ai-task-extraction)
+-- Run these on existing DBs instead of the full schema above:
+-- ---------------------------------------------------------------------------
+--   ALTER TABLE messages ADD COLUMN ai_analyzed_at INTEGER;
+--   ALTER TABLE chat_config ADD COLUMN ai_monitor INTEGER DEFAULT 0;
+--   CREATE TABLE tasks ( ... );  -- see CREATE TABLE above
+--   CREATE INDEX idx_tasks_account ON tasks(account_id, status, created_at DESC);
+--   CREATE INDEX idx_messages_unanalyzed ON messages(account_id, tg_chat_id) WHERE ai_analyzed_at IS NULL;

@@ -3,6 +3,7 @@ export interface Env {
   DB: D1Database;
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
+  AI: Ai;
 }
 
 // Message row — matches schema.sql exactly
