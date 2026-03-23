@@ -461,6 +461,90 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
   const written = result.rowCount ?? 0;
   const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
+
+  // Extract URLs from message text and insert into links table.
+  // Fetch the message ids that were just inserted (or updated) so we can reference them.
+  const URL_RE = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/g;
+  type LinkRow = {
+    account_id: string;
+    tg_chat_id: string;
+    message_id: bigint | null;
+    sender_id: string;
+    url: string;
+    domain: string;
+    sent_at: number;
+  };
+  const linkRows: LinkRow[] = [];
+
+  // Fetch the DB ids for the ingested messages so we can FK into them.
+  let msgIdMap: Map<string, bigint> = new Map();
+  try {
+    const tgMsgIds = msgs.map(m => m.tg_message_id);
+    const tgChatIds = msgs.map(m => m.tg_chat_id);
+    const idRows = await sql(`
+      SELECT id, tg_message_id, tg_chat_id
+      FROM messages
+      WHERE account_id = $1
+        AND (tg_chat_id, tg_message_id) = ANY(
+          SELECT * FROM UNNEST($2::text[], $3::text[])
+        )
+    `, [accountId, tgChatIds, tgMsgIds]) as Array<{ id: bigint; tg_message_id: string; tg_chat_id: string }>;
+    for (const r of idRows) {
+      msgIdMap.set(`${r.tg_chat_id}:${r.tg_message_id}`, r.id);
+    }
+  } catch {
+    // Non-fatal — link extraction continues without FK
+  }
+
+  for (const m of msgs) {
+    if (!m.text) continue;
+    const matches = m.text.match(URL_RE);
+    if (!matches) continue;
+    for (const rawUrl of matches) {
+      let domain: string;
+      try {
+        domain = new URL(rawUrl).hostname;
+      } catch {
+        continue; // skip malformed URLs
+      }
+      const messageId = msgIdMap.get(`${m.tg_chat_id}:${m.tg_message_id}`) ?? null;
+      linkRows.push({
+        account_id: accountId,
+        tg_chat_id: m.tg_chat_id,
+        message_id: messageId,
+        sender_id: m.sender_id ?? '',
+        url: rawUrl,
+        domain,
+        sent_at: m.sent_at,
+      });
+    }
+  }
+
+  if (linkRows.length > 0) {
+    try {
+      await sql(`
+        INSERT INTO links (account_id, tg_chat_id, message_id, sender_id, url, domain, sent_at)
+        SELECT $1,
+          v.tg_chat_id, v.message_id, v.sender_id, v.url, v.domain, v.sent_at
+        FROM UNNEST(
+          $2::text[], $3::bigint[], $4::text[], $5::text[], $6::text[], $7::bigint[]
+        ) AS v(tg_chat_id, message_id, sender_id, url, domain, sent_at)
+        ON CONFLICT (account_id, message_id, url) DO NOTHING
+      `, [
+        accountId,
+        linkRows.map(r => r.tg_chat_id),
+        linkRows.map(r => r.message_id),
+        linkRows.map(r => r.sender_id),
+        linkRows.map(r => r.url),
+        linkRows.map(r => r.domain),
+        linkRows.map(r => r.sent_at),
+      ]);
+    } catch (err) {
+      // Non-fatal — log but don't fail the ingest
+      console.error('[POST /ingest] link extraction error', err);
+    }
+  }
+
   return json({ written, noop });
 }
 
@@ -506,8 +590,14 @@ async function handleSearch(
     : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
-  const from = parseDate(p.get('from'), 0);
-  const to = parseDate(p.get('to'), Math.floor(Date.now() / 1000) + 86400);
+  // New advanced filters
+  const senderId = p.get('sender_id') ?? null;
+  const chatTypeFilter = p.get('chat_type') ?? null;  // 'dm'|'group'|'channel'|<raw type>
+  const mediaType = p.get('media_type') ?? null;      // 'photo'|'video'|'document'|'voice'|...
+  const dateFrom = p.get('date_from') ? parseInt(p.get('date_from')!, 10) : null;
+  const dateTo = p.get('date_to') ? parseInt(p.get('date_to')!, 10) : null;
+  const from = dateFrom ?? parseDate(p.get('from'), 0);
+  const to = dateTo ?? parseDate(p.get('to'), Math.floor(Date.now() / 1000) + 86400);
   const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
   // Keyset pagination: (sent_at, id) pair for stable ordering regardless of insert order
   const beforeSentAt = p.get('before_sent_at') ? parseInt(p.get('before_sent_at')!, 10) : null;
@@ -519,13 +609,28 @@ async function handleSearch(
     let dataRows: Array<{ id: number; sent_at: number }>;
     let total: number;
 
+    // Build a chat_type WHERE fragment from chatTypeFilter.
+    // 'dm'      → positive tg_chat_id (user/DM chats)
+    // 'group'   → chat_type IN ('group','supergroup')
+    // 'channel' → chat_type = 'channel'
+    // any other value treated as a raw chat_type equality match
+    const chatTypeClause = (() => {
+      if (!chatTypeFilter) return '';
+      if (chatTypeFilter === 'dm') return `AND m.tg_chat_id NOT LIKE '-%'`;
+      if (chatTypeFilter === 'group') return `AND m.chat_type IN ('group','supergroup')`;
+      if (chatTypeFilter === 'channel') return `AND m.chat_type = 'channel'`;
+      return `AND m.chat_type = '${chatTypeFilter.replace(/'/g, "''")}'`;
+    })();
+
     if (q !== null) {
       // FTS path: search_vector @@ to_tsquery, sort by recency
-      // Base binds: $1=q, $2=accountId, $3=chatId, $4=senderUsername, $5=from, $6=to
+      // Base binds: $1=q, $2=accountId, $3=chatId, $4=senderUsername, $5=from, $6=to,
+      //             $7=senderId, $8=mediaType
+      const keysetOffset = 8;
       const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (m.sent_at < $7 OR (m.sent_at = $7 AND m.id < $8))`
+        ? `AND (m.sent_at < $${keysetOffset + 1} OR (m.sent_at = $${keysetOffset + 1} AND m.id < $${keysetOffset + 2}))`
         : ``;
-      const baseBinds: unknown[] = [q, accountId, chatId, senderUsername, from, to];
+      const baseBinds: unknown[] = [q, accountId, chatId, senderUsername, from, to, senderId, mediaType];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
@@ -553,6 +658,9 @@ async function handleSearch(
             OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
           AND m.sent_at >= $5
           AND m.sent_at <= $6
+          AND ($7::text IS NULL OR m.sender_id = $7)
+          AND ($8::text IS NULL OR m.media_type = $8)
+          ${chatTypeClause}
           ${keysetClause}
           ${scopeClause}
         ORDER BY m.sent_at DESC, m.id DESC
@@ -570,6 +678,9 @@ async function handleSearch(
             OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
           AND m.sent_at >= $5
           AND m.sent_at <= $6
+          AND ($7::text IS NULL OR m.sender_id = $7)
+          AND ($8::text IS NULL OR m.media_type = $8)
+          ${chatTypeClause}
           ${keysetClause}
           ${scopeClause}
       `.trim();
@@ -583,17 +694,19 @@ async function handleSearch(
       total = parseInt((countResult[0] as { total: string }).total, 10);
     } else {
       // B-tree path: no query, sort by recency
-      // Base binds: $1=accountId, $2=chatId, $3=senderUsername, $4=from, $5=to
+      // Base binds: $1=accountId, $2=chatId, $3=senderUsername, $4=from, $5=to,
+      //             $6=senderId, $7=mediaType
+      const keysetOffset = 7;
       const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (sent_at < $6 OR (sent_at = $6 AND id < $7))`
+        ? `AND (sent_at < $${keysetOffset + 1} OR (sent_at = $${keysetOffset + 1} AND id < $${keysetOffset + 2}))`
         : ``;
-      const baseBinds: unknown[] = [accountId, chatId, senderUsername, from, to];
+      const baseBinds: unknown[] = [accountId, chatId, senderUsername, from, to, senderId, mediaType];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
       // Scope clause: accountId is $1 in B-tree path; starts after base + keyset binds
       const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(
-        role ?? null, '', baseBinds.length + keysetBinds.length + 1, 1,
+        role ?? null, 'm', baseBinds.length + keysetBinds.length + 1, 1,
       );
       const limitIdx = baseBinds.length + keysetBinds.length + scopeBinds.length + 1;
 
@@ -614,6 +727,9 @@ async function handleSearch(
             OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
           AND m.sent_at >= $4
           AND m.sent_at <= $5
+          AND ($6::text IS NULL OR m.sender_id = $6)
+          AND ($7::text IS NULL OR m.media_type = $7)
+          ${chatTypeClause}
           ${keysetClause}
           ${scopeClause}
         ORDER BY m.sent_at DESC, m.id DESC
@@ -622,14 +738,17 @@ async function handleSearch(
 
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
-        FROM messages
-        WHERE account_id = $1
-          AND is_deleted = 0
-          AND ($2::text IS NULL OR tg_chat_id = $2)
-          AND ($3::text IS NULL OR sender_username = $3
-            OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
-          AND sent_at >= $4
-          AND sent_at <= $5
+        FROM messages m
+        WHERE m.account_id = $1
+          AND m.is_deleted = 0
+          AND ($2::text IS NULL OR m.tg_chat_id = $2)
+          AND ($3::text IS NULL OR m.sender_username = $3
+            OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
+          AND m.sent_at >= $4
+          AND m.sent_at <= $5
+          AND ($6::text IS NULL OR m.sender_id = $6)
+          AND ($7::text IS NULL OR m.media_type = $7)
+          ${chatTypeClause}
           ${keysetClause}
           ${scopeClause}
       `.trim();
@@ -3163,6 +3282,418 @@ async function handleMcp(request: Request, env: Env, accountId: string, ctx: Tok
 }
 
 // ---------------------------------------------------------------------------
+// Contact Intelligence handlers
+// ---------------------------------------------------------------------------
+
+async function handleGetContactProfile(
+  senderId: string,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  const sql = getSql(env);
+  try {
+    // Core metrics from messages table
+    const statsRows = await sql(`
+      SELECT
+        COUNT(*)                              AS total_messages,
+        COUNT(DISTINCT tg_chat_id)            AS chats_count,
+        MIN(sent_at)                          AS first_message_at,
+        MAX(sent_at)                          AS last_message_at,
+        MAX(sender_first_name)                AS sender_first_name,
+        MAX(sender_last_name)                 AS sender_last_name,
+        MAX(sender_username)                  AS sender_username
+      FROM messages
+      WHERE account_id = $1 AND sender_id = $2
+    `, [accountId, senderId]) as Array<Record<string, unknown>>;
+
+    const stats = statsRows[0] ?? {};
+
+    // display_name: prefer contacts table, fall back to message-derived name
+    const contactRows = await sql(`
+      SELECT first_name, last_name, username
+      FROM contacts WHERE account_id = $1 AND tg_user_id = $2
+    `, [accountId, senderId]) as Array<{ first_name: string | null; last_name: string | null; username: string | null }>;
+
+    const c = contactRows[0] ?? null;
+    const firstName = c?.first_name ?? (stats.sender_first_name as string | null) ?? null;
+    const lastName  = c?.last_name  ?? (stats.sender_last_name  as string | null) ?? null;
+    const username  = c?.username   ?? (stats.sender_username   as string | null) ?? null;
+    const nameParts = [firstName, lastName].filter(Boolean);
+    const display_name = nameParts.length > 0
+      ? nameParts.join(' ') + (username ? ` (@${username})` : '')
+      : username ? `@${username}` : senderId;
+
+    // Rough avg response time: avg gap between their message and the NEXT self message in same chat
+    const respRows = await sql(`
+      WITH their_msgs AS (
+        SELECT id, tg_chat_id, sent_at
+        FROM messages
+        WHERE account_id = $1 AND sender_id = $2
+      ),
+      next_self AS (
+        SELECT tm.id,
+               MIN(m2.sent_at) - tm.sent_at AS gap_secs
+        FROM their_msgs tm
+        JOIN messages m2 ON m2.account_id = $1
+          AND m2.tg_chat_id = tm.tg_chat_id
+          AND m2.sender_id  = $1
+          AND m2.sent_at > tm.sent_at
+          AND m2.sent_at - tm.sent_at < 86400
+        GROUP BY tm.id, tm.sent_at
+      )
+      SELECT AVG(gap_secs) AS avg_gap_secs FROM next_self
+    `, [accountId, senderId]) as Array<{ avg_gap_secs: string | null }>;
+    const avgGapSecs = respRows[0]?.avg_gap_secs !== null ? parseFloat(respRows[0]?.avg_gap_secs ?? '0') : null;
+    const avg_response_time_hrs = avgGapSecs !== null ? Math.round((avgGapSecs / 3600) * 10) / 10 : null;
+
+    // Notes
+    const noteRows = await sql(`
+      SELECT id, note, created_at FROM contact_notes
+      WHERE account_id = $1 AND sender_id = $2
+      ORDER BY created_at DESC
+    `, [accountId, senderId]) as Array<{ id: unknown; note: string; created_at: unknown }>;
+
+    // Tags
+    const tagRows = await sql(`
+      SELECT tag FROM contact_tags WHERE account_id = $1 AND sender_id = $2 ORDER BY tag
+    `, [accountId, senderId]) as Array<{ tag: string }>;
+
+    // Status
+    const statusRows = await sql(`
+      SELECT status FROM contact_status WHERE account_id = $1 AND sender_id = $2
+    `, [accountId, senderId]) as Array<{ status: string }>;
+
+    return json({
+      sender_id: senderId,
+      display_name,
+      total_messages: Number(stats.total_messages ?? 0),
+      chats_count:    Number(stats.chats_count ?? 0),
+      first_message_at: stats.first_message_at ? Number(stats.first_message_at) : null,
+      last_message_at:  stats.last_message_at  ? Number(stats.last_message_at)  : null,
+      avg_response_time_hrs,
+      notes: noteRows.map(n => ({ id: (n.id as bigint).toString(), note: n.note, created_at: Number(n.created_at) })),
+      tags: tagRows.map(t => t.tag),
+      status: statusRows[0]?.status ?? null,
+    });
+  } catch (err) {
+    console.error('[GET /contacts/:id] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleGetContactMessages(
+  senderId: string,
+  request: Request,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const limit    = Math.min(parseInt(url.searchParams.get('limit')    ?? '50', 10) || 50, 200);
+  const beforeId = url.searchParams.get('before_id') ? parseInt(url.searchParams.get('before_id')!, 10) : null;
+
+  const sql = getSql(env);
+  try {
+    const b: unknown[] = [accountId, senderId];
+    const kc = beforeId !== null ? `AND m.id < $${b.length + 1}` : '';
+    if (beforeId !== null) b.push(beforeId);
+    b.push(limit);
+    const limitIdx = b.length;
+
+    const rows = await sql(`
+      SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
+             m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
+             m.text, m.sent_at
+      FROM messages m
+      WHERE m.account_id = $1 AND m.sender_id = $2
+        ${kc}
+      ORDER BY m.sent_at DESC, m.id DESC
+      LIMIT $${limitIdx}
+    `, b) as Array<Record<string, unknown>>;
+
+    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    return json({
+      messages: rows.map(r => ({ ...r, id: Number(r.id) })),
+      next_before_id: lastRow ? Number(lastRow.id) : null,
+    });
+  } catch (err) {
+    console.error('[GET /contacts/:id/messages] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handlePostContactNote(
+  senderId: string,
+  request: Request,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+  const note = (body as Record<string, unknown>).note;
+  if (typeof note !== 'string' || !note.trim()) return json({ ok: false, error: 'note is required' }, 400);
+  const sql = getSql(env);
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const rows = await sql(`
+      INSERT INTO contact_notes (account_id, sender_id, note, created_at)
+      VALUES ($1, $2, $3, $4) RETURNING id, created_at
+    `, [accountId, senderId, note.trim(), now]) as Array<{ id: bigint; created_at: bigint }>;
+    return json({ ok: true, id: rows[0].id.toString(), created_at: Number(rows[0].created_at) });
+  } catch (err) {
+    console.error('[POST /contacts/:id/notes] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleDeleteContactNote(
+  noteId: number,
+  senderId: string,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  const sql = getSql(env);
+  try {
+    const result = await sql(`
+      DELETE FROM contact_notes WHERE id = $1 AND account_id = $2 AND sender_id = $3
+    `, [noteId, accountId, senderId], { fullResults: true }) as { rowCount?: number };
+    if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Note not found' }, 404);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[DELETE /contacts/:id/notes/:note_id] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handlePutContactTags(
+  senderId: string,
+  request: Request,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+  const tags = (body as Record<string, unknown>).tags;
+  if (!Array.isArray(tags) || tags.some(t => typeof t !== 'string')) {
+    return json({ ok: false, error: 'tags must be a string[]' }, 400);
+  }
+  const clean = (tags as string[]).map(t => t.trim()).filter(Boolean);
+  const sql = getSql(env);
+  try {
+    await sql(`DELETE FROM contact_tags WHERE account_id = $1 AND sender_id = $2`, [accountId, senderId]);
+    if (clean.length > 0) {
+      await sql(`
+        INSERT INTO contact_tags (account_id, sender_id, tag)
+        SELECT $1, $2, v.tag FROM UNNEST($3::text[]) AS v(tag)
+        ON CONFLICT DO NOTHING
+      `, [accountId, senderId, clean]);
+    }
+    return json({ ok: true, tags: clean });
+  } catch (err) {
+    console.error('[PUT /contacts/:id/tags] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handlePutContactStatus(
+  senderId: string,
+  request: Request,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+  const status = (body as Record<string, unknown>).status;
+  const VALID_STATUSES = ['warm', 'neutral', 'dormant', 'needs-follow-up'];
+  if (typeof status !== 'string' || !VALID_STATUSES.includes(status)) {
+    return json({ ok: false, error: `status must be one of: ${VALID_STATUSES.join(', ')}` }, 400);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const sql = getSql(env);
+  try {
+    await sql(`
+      INSERT INTO contact_status (account_id, sender_id, status, updated_at)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (account_id, sender_id) DO UPDATE SET status = $3, updated_at = $4
+    `, [accountId, senderId, status, now]);
+    return json({ ok: true, status });
+  } catch (err) {
+    console.error('[PUT /contacts/:id/status] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Contact Briefings
+// ---------------------------------------------------------------------------
+
+async function handleGetContactBriefing(
+  senderId: string,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `SELECT sender_id, generated_at, model, data
+       FROM contact_briefings WHERE account_id = $1 AND sender_id = $2`,
+      [accountId, senderId],
+    ) as Array<Record<string, unknown>>;
+    if (rows.length === 0) return json({ briefing: null });
+    const r = rows[0];
+    return json({
+      briefing: {
+        sender_id: r.sender_id,
+        generated_at: Number(r.generated_at),
+        model: r.model,
+        data: r.data,
+      },
+    });
+  } catch (err) {
+    console.error('[GET /contacts/:id/briefing] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleGenerateContactBriefing(
+  senderId: string,
+  request: Request,
+  env: Env,
+  accountId: string,
+): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+  const modelConfig = (body as Record<string, unknown>).model_config as Record<string, unknown> | undefined;
+  if (!modelConfig || typeof modelConfig !== 'object') {
+    return json({ ok: false, error: 'model_config is required' }, 400);
+  }
+
+  const sql = getSql(env);
+  try {
+    // Fetch last 200 messages across all chats with this sender
+    const msgRows = await sql(
+      `SELECT text, sent_at, tg_chat_id, chat_name, sender_username, sender_first_name
+       FROM messages
+       WHERE account_id = $1 AND sender_id = $2 AND text IS NOT NULL AND text != ''
+       ORDER BY sent_at DESC
+       LIMIT 200`,
+      [accountId, senderId],
+    ) as Array<Record<string, unknown>>;
+
+    if (msgRows.length === 0) {
+      return json({ ok: false, error: 'No messages found for this contact' }, 404);
+    }
+
+    // Build prompt
+    const msgLines = msgRows
+      .slice()
+      .reverse()
+      .map(m => {
+        const sender = m.sender_username ? `@${m.sender_username}` : (m.sender_first_name as string ?? senderId);
+        const chatLabel = (m.chat_name as string | null) ?? (m.tg_chat_id as string);
+        const ts = new Date(Number(m.sent_at) * 1000).toISOString().slice(0, 10);
+        return `[${ts}] [${chatLabel}] ${sender}: ${m.text}`;
+      })
+      .join('\n');
+
+    const prompt = `You are analysing a person's communication history in Telegram. Here are their recent messages across all conversations:\n\n${msgLines}\n\nGenerate a JSON briefing with exactly these fields:\n- summary: 2-3 sentence overview of this person and your relationship\n- topics: array of key recurring topics (strings)\n- tone: one of "warm", "neutral", "professional", "tense"\n- open_threads: array of unresolved questions or pending items (strings)\n- agreed_items: array of things explicitly agreed upon (strings)\n- last_sentiment: one sentence describing the most recent emotional tone\n- relationship_arc: one sentence describing how the relationship has evolved\n\nReturn only valid JSON, no markdown, no explanation.`;
+
+    const provider = typeof modelConfig.provider === 'string' ? modelConfig.provider : 'openai';
+    const model = typeof modelConfig.model === 'string' ? modelConfig.model : 'gpt-4o-mini';
+    const apiKeyRef = typeof modelConfig.api_key_ref === 'string' ? modelConfig.api_key_ref : null;
+    const apiKey = apiKeyRef ? ((env as unknown as Record<string, string>)[apiKeyRef] ?? '') : '';
+
+    let rawText = '';
+
+    if (provider === 'cloudflare-ai') {
+      const res = await env.AI.run(
+        model as Parameters<typeof env.AI.run>[0],
+        { messages: [{ role: 'user', content: prompt }] } as AiTextGenerationInput,
+      ) as { response?: string | null };
+      rawText = res.response ?? '';
+    } else if (provider === 'anthropic') {
+      if (!apiKey) return json({ ok: false, error: `api_key_ref "${apiKeyRef ?? '(none)'}" is not set in Worker environment` }, 400);
+      const endpoint = typeof modelConfig.endpoint === 'string'
+        ? modelConfig.endpoint
+        : 'https://api.anthropic.com/v1/messages';
+      const aiRes = await (globalThis.fetch as unknown as (url: string, init: RequestInit) => Promise<Response>)(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+      if (!aiRes.ok) return json({ ok: false, error: `Anthropic API error: ${aiRes.status}` }, 502);
+      const aiBody = await aiRes.json() as Record<string, unknown>;
+      const contentArr = (aiBody.content as Array<Record<string, unknown>>) ?? [];
+      const textBlock = contentArr.find(c => c.type === 'text');
+      rawText = typeof textBlock?.text === 'string' ? textBlock.text : '';
+    } else {
+      // OpenAI-compatible
+      if (!apiKey) return json({ ok: false, error: `api_key_ref "${apiKeyRef ?? '(none)'}" is not set in Worker environment` }, 400);
+      const endpoint = typeof modelConfig.endpoint === 'string'
+        ? modelConfig.endpoint
+        : 'https://api.openai.com/v1/chat/completions';
+      const aiRes = await (globalThis.fetch as unknown as (url: string, init: RequestInit) => Promise<Response>)(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          response_format: { type: 'json_object' },
+        }),
+      });
+      if (!aiRes.ok) return json({ ok: false, error: `Model API error: ${aiRes.status}` }, 502);
+      const aiBody = await aiRes.json() as Record<string, unknown>;
+      const choice = ((aiBody.choices as Array<Record<string, unknown>>) ?? [])[0];
+      const assistantMsg = (choice?.message as Record<string, unknown>) ?? {};
+      rawText = typeof assistantMsg.content === 'string' ? assistantMsg.content : '';
+    }
+
+    // Parse JSON from AI response (strip markdown fences if present)
+    let data: Record<string, unknown>;
+    try {
+      const cleaned = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+      data = JSON.parse(cleaned) as Record<string, unknown>;
+    } catch {
+      return json({ ok: false, error: 'AI returned non-JSON response', raw: rawText.slice(0, 300) }, 502);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    await sql(
+      `INSERT INTO contact_briefings (account_id, sender_id, generated_at, model, data)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (account_id, sender_id) DO UPDATE
+         SET generated_at = EXCLUDED.generated_at,
+             model = EXCLUDED.model,
+             data = EXCLUDED.data`,
+      [accountId, senderId, now, model, JSON.stringify(data)],
+    );
+
+    return json({
+      ok: true,
+      briefing: {
+        sender_id: senderId,
+        generated_at: now,
+        model,
+        data,
+      },
+    });
+  } catch (err) {
+    console.error('[POST /contacts/:id/briefing/generate] error', err);
+    return json({ ok: false, error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -3193,6 +3724,65 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 
   if (method === 'POST' && pathname === '/contacts') {
     return handlePostContacts(request, env, accountId);
+  }
+
+  // ── Contact Intelligence ─────────────────────────────────────────────────
+
+  // GET /contacts/:sender_id/briefing — must be before generic profile route
+  const contactBriefingMatch = pathname.match(/^\/contacts\/([^/]+)\/briefing$/);
+  if (method === 'GET' && contactBriefingMatch) {
+    const senderId = decodeURIComponent(contactBriefingMatch[1]);
+    return handleGetContactBriefing(senderId, env, accountId);
+  }
+
+  // POST /contacts/:sender_id/briefing/generate — on-demand AI generation
+  const contactBriefingGenerateMatch = pathname.match(/^\/contacts\/([^/]+)\/briefing\/generate$/);
+  if (method === 'POST' && contactBriefingGenerateMatch) {
+    const senderId = decodeURIComponent(contactBriefingGenerateMatch[1]);
+    return handleGenerateContactBriefing(senderId, request, env, accountId);
+  }
+
+  // GET /contacts/:sender_id — contact profile
+  const contactProfileMatch = pathname.match(/^\/contacts\/([^/]+)$/);
+  if (method === 'GET' && contactProfileMatch) {
+    const senderId = decodeURIComponent(contactProfileMatch[1]);
+    return handleGetContactProfile(senderId, env, accountId);
+  }
+
+  // GET /contacts/:sender_id/messages
+  const contactMessagesMatch = pathname.match(/^\/contacts\/([^/]+)\/messages$/);
+  if (method === 'GET' && contactMessagesMatch) {
+    const senderId = decodeURIComponent(contactMessagesMatch[1]);
+    return handleGetContactMessages(senderId, request, env, accountId);
+  }
+
+  // POST /contacts/:sender_id/notes
+  const contactNotesMatch = pathname.match(/^\/contacts\/([^/]+)\/notes$/);
+  if (method === 'POST' && contactNotesMatch) {
+    const senderId = decodeURIComponent(contactNotesMatch[1]);
+    return handlePostContactNote(senderId, request, env, accountId);
+  }
+
+  // DELETE /contacts/:sender_id/notes/:note_id
+  const contactNoteDeleteMatch = pathname.match(/^\/contacts\/([^/]+)\/notes\/(\d+)$/);
+  if (method === 'DELETE' && contactNoteDeleteMatch) {
+    const senderId = decodeURIComponent(contactNoteDeleteMatch[1]);
+    const noteId   = parseInt(contactNoteDeleteMatch[2], 10);
+    return handleDeleteContactNote(noteId, senderId, env, accountId);
+  }
+
+  // PUT /contacts/:sender_id/tags
+  const contactTagsMatch = pathname.match(/^\/contacts\/([^/]+)\/tags$/);
+  if (method === 'PUT' && contactTagsMatch) {
+    const senderId = decodeURIComponent(contactTagsMatch[1]);
+    return handlePutContactTags(senderId, request, env, accountId);
+  }
+
+  // PUT /contacts/:sender_id/status
+  const contactStatusMatch = pathname.match(/^\/contacts\/([^/]+)\/status$/);
+  if (method === 'PUT' && contactStatusMatch) {
+    const senderId = decodeURIComponent(contactStatusMatch[1]);
+    return handlePutContactStatus(senderId, request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/chats') {
@@ -3543,6 +4133,324 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
       });
     } catch (err) {
       console.error('[GET /insights] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  // ── Follow-ups ─────────────────────────────────────────────────────────────
+
+  if (method === 'GET' && pathname === '/follow-ups/overdue') {
+    try {
+      const sql = getSql(env);
+      const now = Math.floor(Date.now() / 1000);
+      const cutoff = now - 86400; // 24h ago
+      const rows = await sql(`
+        SELECT DISTINCT ON (m.tg_chat_id)
+          m.tg_chat_id,
+          m.chat_name,
+          m.sent_at AS last_message_at,
+          COALESCE(m.sender_username, m.sender_first_name, m.sender_id) AS sender_display_name,
+          LEFT(m.text, 100) AS snippet
+        FROM messages m
+        WHERE m.account_id = $1
+          AND m.sender_id != $1
+          AND m.is_deleted = 0
+          AND m.text IS NOT NULL
+        ORDER BY m.tg_chat_id, m.sent_at DESC
+      `, [accountId]) as Array<Record<string, unknown>>;
+
+      // Filter: chats where the last message is from other party and older than 24h
+      const overdue = rows.filter(r => Number(r.last_message_at) < cutoff);
+      return json(overdue.map(r => ({
+        tg_chat_id: r.tg_chat_id,
+        chat_name: r.chat_name ?? null,
+        last_message_at: Number(r.last_message_at),
+        sender_display_name: r.sender_display_name ?? null,
+        snippet: r.snippet ?? null,
+      })));
+    } catch (err) {
+      console.error('[GET /follow-ups/overdue] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  if (method === 'GET' && pathname === '/follow-ups') {
+    try {
+      const url = new URL(request.url);
+      const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
+      const sql = getSql(env);
+      const now = Math.floor(Date.now() / 1000);
+      const rows = await sql(`
+        SELECT f.id, f.tg_chat_id, f.message_id, f.remind_at, f.note, f.created_at,
+               (SELECT m.chat_name FROM messages m
+                WHERE m.account_id = $1 AND m.tg_chat_id = f.tg_chat_id
+                ORDER BY m.sent_at DESC LIMIT 1) AS chat_name
+        FROM follow_ups f
+        WHERE f.account_id = $1 AND f.dismissed = FALSE
+        ORDER BY f.remind_at ASC
+        LIMIT $2
+      `, [accountId, limit]) as Array<Record<string, unknown>>;
+      return json(rows.map(r => ({
+        id: (r.id as bigint).toString(),
+        tg_chat_id: r.tg_chat_id,
+        chat_name: r.chat_name ?? null,
+        message_id: r.message_id ? (r.message_id as bigint).toString() : null,
+        remind_at: Number(r.remind_at),
+        note: r.note ?? null,
+        is_overdue: Number(r.remind_at) < now,
+        created_at: Number(r.created_at),
+      })));
+    } catch (err) {
+      console.error('[GET /follow-ups] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  if (method === 'POST' && pathname === '/follow-ups') {
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (typeof b.tg_chat_id !== 'string' || !b.tg_chat_id) return json({ ok: false, error: 'tg_chat_id is required' }, 400);
+    if (typeof b.remind_at !== 'number' || !Number.isInteger(b.remind_at)) return json({ ok: false, error: 'remind_at must be a Unix epoch integer' }, 400);
+    try {
+      const sql = getSql(env);
+      const now = Math.floor(Date.now() / 1000);
+      const rows = await sql(
+        `INSERT INTO follow_ups (account_id, tg_chat_id, message_id, remind_at, note, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [
+          accountId,
+          b.tg_chat_id,
+          typeof b.message_id === 'number' ? b.message_id : null,
+          b.remind_at,
+          typeof b.note === 'string' ? b.note : null,
+          now,
+        ],
+      ) as Array<{ id: bigint }>;
+      return json({ ok: true, id: rows[0].id.toString() }, 201);
+    } catch (err) {
+      console.error('[POST /follow-ups] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  const followUpDeleteMatch = pathname.match(/^\/follow-ups\/(\d+)$/);
+  if (method === 'DELETE' && followUpDeleteMatch) {
+    const id = followUpDeleteMatch[1];
+    try {
+      const sql = getSql(env);
+      await sql(
+        `UPDATE follow_ups SET dismissed = TRUE WHERE id = $1 AND account_id = $2`,
+        [id, accountId],
+      );
+      return json({ ok: true });
+    } catch (err) {
+      console.error('[DELETE /follow-ups/:id] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  // ── Saved Searches ────────────────────────────────────────────────────────
+
+  if (method === 'GET' && pathname === '/saved-searches') {
+    try {
+      const sql = getSql(env);
+      const rows = await sql(
+        `SELECT id, name, query, sender_id, chat_type, media_type, date_from, date_to, created_at
+         FROM saved_searches WHERE account_id = $1 ORDER BY created_at DESC`,
+        [accountId],
+      ) as Array<Record<string, unknown>>;
+      return json(rows.map(r => ({
+        id: (r.id as bigint).toString(),
+        name: r.name,
+        query: r.query ?? null,
+        sender_id: r.sender_id ?? null,
+        chat_type: r.chat_type ?? null,
+        media_type: r.media_type ?? null,
+        date_from: r.date_from ? Number(r.date_from) : null,
+        date_to: r.date_to ? Number(r.date_to) : null,
+        created_at: Number(r.created_at),
+      })));
+    } catch (err) {
+      console.error('[GET /saved-searches] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  if (method === 'POST' && pathname === '/saved-searches') {
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (typeof b.name !== 'string' || !b.name.trim()) return json({ ok: false, error: 'name is required' }, 400);
+    const name = b.name.trim();
+    const query = typeof b.query === 'string' && b.query.trim() ? b.query.trim() : null;
+    const senderId = typeof b.sender_id === 'string' && b.sender_id.trim() ? b.sender_id.trim() : null;
+    const chatType = typeof b.chat_type === 'string' && b.chat_type.trim() ? b.chat_type.trim() : null;
+    const mediaType = typeof b.media_type === 'string' && b.media_type.trim() ? b.media_type.trim() : null;
+    const dateFrom = typeof b.date_from === 'number' ? b.date_from : null;
+    const dateTo = typeof b.date_to === 'number' ? b.date_to : null;
+    try {
+      const sql = getSql(env);
+      const now = Math.floor(Date.now() / 1000);
+      const rows = await sql(
+        `INSERT INTO saved_searches (account_id, name, query, sender_id, chat_type, media_type, date_from, date_to, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [accountId, name, query, senderId, chatType, mediaType, dateFrom, dateTo, now],
+      ) as Array<{ id: bigint }>;
+      return json({ ok: true, id: rows[0].id.toString() });
+    } catch (err) {
+      console.error('[POST /saved-searches] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  const savedSearchDeleteMatch = pathname.match(/^\/saved-searches\/(\d+)$/);
+  if (method === 'DELETE' && savedSearchDeleteMatch) {
+    const searchId = savedSearchDeleteMatch[1];
+    try {
+      const sql = getSql(env);
+      const result = await sql(
+        `DELETE FROM saved_searches WHERE id = $1 AND account_id = $2`,
+        [BigInt(searchId), accountId],
+        { fullResults: true },
+      ) as { rowCount?: number };
+      if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Not found' }, 404);
+      return json({ ok: true });
+    } catch (err) {
+      console.error('[DELETE /saved-searches] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  // ── Links ─────────────────────────────────────────────────────────────────
+
+  if (method === 'GET' && pathname === '/links') {
+    try {
+      const sp = new URL(request.url).searchParams;
+      const limit = Math.min(parseInt(sp.get('limit') ?? '50', 10) || 50, 200);
+      const beforeId = sp.get('before_id') ? BigInt(sp.get('before_id')!) : null;
+      const domainFilter = sp.get('domain') ?? null;
+      const senderFilter = sp.get('sender_id') ?? null;
+      const chatFilter = sp.get('tg_chat_id') ?? null;
+      const bookmarkedOnly = sp.get('bookmarked') === 'true';
+      const qFilter = sp.get('q') ?? null;
+
+      const sql = getSql(env);
+      const binds: unknown[] = [accountId];
+      let n = 2;
+      const clauses: string[] = [];
+
+      if (beforeId !== null) {
+        clauses.push(`l.id < $${n++}`);
+        binds.push(beforeId);
+      }
+      if (domainFilter) {
+        clauses.push(`l.domain = $${n++}`);
+        binds.push(domainFilter);
+      }
+      if (senderFilter) {
+        clauses.push(`l.sender_id = $${n++}`);
+        binds.push(senderFilter);
+      }
+      if (chatFilter) {
+        clauses.push(`l.tg_chat_id = $${n++}`);
+        binds.push(chatFilter);
+      }
+      if (bookmarkedOnly) {
+        clauses.push(`l.bookmarked = TRUE`);
+      }
+      if (qFilter) {
+        clauses.push(`l.url ILIKE $${n++}`);
+        binds.push(`%${qFilter}%`);
+      }
+
+      const where = clauses.length > 0 ? `AND ${clauses.join(' AND ')}` : '';
+      binds.push(limit);
+      const limitN = n;
+
+      const rows = await sql(`
+        SELECT
+          l.id, l.tg_chat_id, l.message_id, l.sender_id, l.url, l.domain,
+          l.sent_at, l.bookmarked, l.tag, l.created_at,
+          (SELECT m.chat_name FROM messages m
+           WHERE m.account_id = $1 AND m.tg_chat_id = l.tg_chat_id
+           ORDER BY m.sent_at DESC LIMIT 1) AS chat_name,
+          COALESCE(
+            (SELECT COALESCE(m.sender_username, m.sender_first_name, m.sender_id)
+             FROM messages m
+             WHERE m.account_id = $1 AND m.id = l.message_id
+             LIMIT 1),
+            l.sender_id
+          ) AS sender_display_name
+        FROM links l
+        WHERE l.account_id = $1
+          ${where}
+        ORDER BY l.sent_at DESC, l.id DESC
+        LIMIT $${limitN}
+      `, binds) as Array<Record<string, unknown>>;
+
+      return json(rows.map(r => ({
+        id: (r.id as bigint).toString(),
+        tg_chat_id: r.tg_chat_id,
+        message_id: r.message_id ? (r.message_id as bigint).toString() : null,
+        sender_id: r.sender_id,
+        url: r.url,
+        domain: r.domain,
+        sent_at: Number(r.sent_at),
+        bookmarked: r.bookmarked === true || r.bookmarked === 1,
+        tag: r.tag ?? null,
+        chat_name: r.chat_name ?? null,
+        sender_display_name: r.sender_display_name ?? r.sender_id,
+      })));
+    } catch (err) {
+      console.error('[GET /links] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  // PUT /links/:id/bookmark
+  const linkBookmarkMatch = pathname.match(/^\/links\/(\d+)\/bookmark$/);
+  if (method === 'PUT' && linkBookmarkMatch) {
+    const linkId = BigInt(linkBookmarkMatch[1]);
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (typeof b.bookmarked !== 'boolean') return json({ ok: false, error: 'bookmarked (boolean) required' }, 400);
+    try {
+      const sql = getSql(env);
+      const result = await sql(
+        `UPDATE links SET bookmarked = $1 WHERE id = $2 AND account_id = $3`,
+        [b.bookmarked, linkId, accountId],
+        { fullResults: true },
+      ) as { rowCount?: number };
+      if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Not found' }, 404);
+      return json({ ok: true, bookmarked: b.bookmarked });
+    } catch (err) {
+      console.error('[PUT /links/bookmark] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
+  }
+
+  // PUT /links/:id/tag
+  const linkTagMatch = pathname.match(/^\/links\/(\d+)\/tag$/);
+  if (method === 'PUT' && linkTagMatch) {
+    const linkId = BigInt(linkTagMatch[1]);
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (!('tag' in b)) return json({ ok: false, error: 'tag field required (string or null)' }, 400);
+    const tag = typeof b.tag === 'string' ? b.tag.trim() || null : null;
+    try {
+      const sql = getSql(env);
+      const result = await sql(
+        `UPDATE links SET tag = $1 WHERE id = $2 AND account_id = $3`,
+        [tag, linkId, accountId],
+        { fullResults: true },
+      ) as { rowCount?: number };
+      if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Not found' }, 404);
+      return json({ ok: true, tag });
+    } catch (err) {
+      console.error('[PUT /links/tag] DB error', err);
       return json({ ok: false, error: 'DB error' }, 500);
     }
   }

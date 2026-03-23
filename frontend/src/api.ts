@@ -121,6 +121,10 @@ export function fetchMessages(params: {
   q?: string;
   chat_id?: string;
   chat_type?: string;
+  sender_id?: string;
+  media_type?: string;
+  date_from?: number;
+  date_to?: number;
   limit?: number;
   next_before_id?: number;
   next_before_sent_at?: number;
@@ -129,10 +133,48 @@ export function fetchMessages(params: {
   if (params.q) p.set('q', params.q);
   if (params.chat_id) p.set('chat_id', params.chat_id);
   if (params.chat_type) p.set('chat_type', params.chat_type);
+  if (params.sender_id) p.set('sender_id', params.sender_id);
+  if (params.media_type) p.set('media_type', params.media_type);
+  if (params.date_from) p.set('date_from', String(params.date_from));
+  if (params.date_to) p.set('date_to', String(params.date_to));
   p.set('limit', String(params.limit ?? 50));
   if (params.next_before_id) p.set('next_before_id', String(params.next_before_id));
   if (params.next_before_sent_at) p.set('next_before_sent_at', String(params.next_before_sent_at));
   return req<SearchResult>(`/search?${p}`);
+}
+
+// ── Saved Searches ──────────────────────────────────────────────────────────
+export interface SavedSearch {
+  id: string;
+  name: string;
+  query: string | null;
+  sender_id: string | null;
+  chat_type: string | null;
+  media_type: string | null;
+  date_from: number | null;
+  date_to: number | null;
+  created_at: number;
+}
+
+export const fetchSavedSearches = () => req<SavedSearch[]>('/saved-searches');
+
+export function createSavedSearch(data: {
+  name: string;
+  query?: string | null;
+  sender_id?: string | null;
+  chat_type?: string | null;
+  media_type?: string | null;
+  date_from?: number | null;
+  date_to?: number | null;
+}) {
+  return req<{ ok: boolean; id: string }>('/saved-searches', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteSavedSearch(id: string) {
+  return req<{ ok: boolean }>(`/saved-searches/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 // ── Chats ──────────────────────────────────────────────────────────────────
@@ -348,6 +390,200 @@ export interface ChatInsight {
 
 export function fetchInsight(chatId: string) {
   return req<{ insight: ChatInsight | null }>(`/insights/${encodeURIComponent(chatId)}`);
+}
+
+// ── Follow-ups ──────────────────────────────────────────────────────────────
+export interface FollowUp {
+  id: string;
+  tg_chat_id: string;
+  chat_name: string | null;
+  message_id: string | null;
+  remind_at: number;      // Unix epoch seconds
+  note: string | null;
+  is_overdue: boolean;
+  created_at: number;
+}
+
+export interface OverdueChat {
+  tg_chat_id: string;
+  chat_name: string | null;
+  last_message_at: number;
+  sender_display_name: string | null;
+  snippet: string | null;
+}
+
+export function fetchFollowUps(params: { limit?: number } = {}) {
+  const p = new URLSearchParams();
+  if (params.limit) p.set('limit', String(params.limit));
+  return req<FollowUp[]>(`/follow-ups?${p}`);
+}
+
+export function fetchOverdueChats() {
+  return req<OverdueChat[]>('/follow-ups/overdue');
+}
+
+export function createFollowUp(data: {
+  tg_chat_id: string;
+  message_id?: number | null;
+  remind_at: number;
+  note?: string | null;
+}) {
+  return req<{ ok: boolean; id: string }>('/follow-ups', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export function dismissFollowUp(id: string) {
+  return req<{ ok: boolean }>(`/follow-ups/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// ── Contact Intelligence ────────────────────────────────────────────────────
+
+export interface ContactNote {
+  id: string;
+  note: string;
+  created_at: number;
+}
+
+export type ContactStatusValue = 'warm' | 'neutral' | 'dormant' | 'needs-follow-up';
+
+export interface ContactProfile {
+  sender_id: string;
+  display_name: string;
+  total_messages: number;
+  chats_count: number;
+  first_message_at: number | null;
+  last_message_at: number | null;
+  avg_response_time_hrs: number | null;
+  notes: ContactNote[];
+  tags: string[];
+  status: ContactStatusValue | null;
+}
+
+export interface ContactMessagesResult {
+  messages: Message[];
+  next_before_id: number | null;
+}
+
+export function fetchContactProfile(senderId: string) {
+  return req<ContactProfile>(`/contacts/${encodeURIComponent(senderId)}`);
+}
+
+export function fetchContactMessages(senderId: string, params: { limit?: number; before_id?: number } = {}) {
+  const p = new URLSearchParams();
+  p.set('limit', String(params.limit ?? 50));
+  if (params.before_id) p.set('before_id', String(params.before_id));
+  return req<ContactMessagesResult>(`/contacts/${encodeURIComponent(senderId)}/messages?${p}`);
+}
+
+export function addContactNote(senderId: string, note: string) {
+  return req<{ ok: boolean; id: string; created_at: number }>(`/contacts/${encodeURIComponent(senderId)}/notes`, {
+    method: 'POST',
+    body: JSON.stringify({ note }),
+  });
+}
+
+export function deleteContactNote(senderId: string, noteId: string) {
+  return req<{ ok: boolean }>(`/contacts/${encodeURIComponent(senderId)}/notes/${encodeURIComponent(noteId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function setContactTags(senderId: string, tags: string[]) {
+  return req<{ ok: boolean; tags: string[] }>(`/contacts/${encodeURIComponent(senderId)}/tags`, {
+    method: 'PUT',
+    body: JSON.stringify({ tags }),
+  });
+}
+
+export function setContactStatus(senderId: string, status: ContactStatusValue) {
+  return req<{ ok: boolean; status: string }>(`/contacts/${encodeURIComponent(senderId)}/status`, {
+    method: 'PUT',
+    body: JSON.stringify({ status }),
+  });
+}
+
+// ── Contact Briefings ────────────────────────────────────────────────────────
+
+export interface ContactBriefingData {
+  summary: string;
+  topics: string[];
+  tone: 'warm' | 'neutral' | 'professional' | 'tense';
+  open_threads: string[];
+  agreed_items: string[];
+  last_sentiment: string;
+  relationship_arc: string;
+}
+
+export interface ContactBriefing {
+  sender_id: string;
+  generated_at: number;
+  model: string;
+  data: ContactBriefingData;
+}
+
+export function fetchContactBriefing(senderId: string) {
+  return req<{ briefing: ContactBriefing | null }>(`/contacts/${encodeURIComponent(senderId)}/briefing`);
+}
+
+export function generateContactBriefing(
+  senderId: string,
+  modelConfig: { provider: string; model: string; api_key_ref: string },
+) {
+  return req<{ ok: boolean; briefing: ContactBriefing }>(`/contacts/${encodeURIComponent(senderId)}/briefing/generate`, {
+    method: 'POST',
+    body: JSON.stringify({ model_config: modelConfig }),
+  });
+}
+
+// ── Links ───────────────────────────────────────────────────────────────────
+export interface LinkItem {
+  id: string;
+  tg_chat_id: string;
+  message_id: string | null;
+  sender_id: string;
+  url: string;
+  domain: string;
+  sent_at: number;
+  bookmarked: boolean;
+  tag: string | null;
+  chat_name: string | null;
+  sender_display_name: string;
+}
+
+export function fetchLinks(params: {
+  domain?: string;
+  sender_id?: string;
+  tg_chat_id?: string;
+  bookmarked?: boolean;
+  limit?: number;
+  before_id?: string;
+  q?: string;
+} = {}) {
+  const p = new URLSearchParams();
+  p.set('limit', String(params.limit ?? 50));
+  if (params.domain) p.set('domain', params.domain);
+  if (params.sender_id) p.set('sender_id', params.sender_id);
+  if (params.tg_chat_id) p.set('tg_chat_id', params.tg_chat_id);
+  if (params.bookmarked) p.set('bookmarked', 'true');
+  if (params.before_id) p.set('before_id', params.before_id);
+  if (params.q) p.set('q', params.q);
+  return req<LinkItem[]>(`/links?${p}`);
+}
+
+export function bookmarkLink(id: string, bookmarked: boolean) {
+  return req<{ ok: boolean; bookmarked: boolean }>(`/links/${encodeURIComponent(id)}/bookmark`, {
+    method: 'PUT',
+    body: JSON.stringify({ bookmarked }),
+  });
+}
+
+export function tagLink(id: string, tag: string | null) {
+  return req<{ ok: boolean; tag: string | null }>(`/links/${encodeURIComponent(id)}/tag`, {
+    method: 'PUT',
+    body: JSON.stringify({ tag }),
+  });
 }
 
 // ── Auth probe ─────────────────────────────────────────────────────────────

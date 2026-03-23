@@ -326,3 +326,118 @@ CREATE TABLE IF NOT EXISTS chat_insights (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_insights_account ON chat_insights (account_id);
+
+-- ---------------------------------------------------------------------------
+-- Contact Briefings — AI-generated per-contact summary across all chats
+-- ---------------------------------------------------------------------------
+
+-- data JSONB shape:
+-- {
+--   "summary": "...",
+--   "topics": ["...", "..."],
+--   "tone": "warm|neutral|professional|tense",
+--   "open_threads": ["...", "..."],
+--   "agreed_items": ["...", "..."],
+--   "last_sentiment": "...",
+--   "relationship_arc": "..."
+-- }
+
+CREATE TABLE IF NOT EXISTS contact_briefings (
+  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id      TEXT NOT NULL,
+  sender_id       TEXT NOT NULL,
+  generated_at    BIGINT NOT NULL,
+  model           TEXT NOT NULL,
+  data            JSONB NOT NULL,
+  UNIQUE (account_id, sender_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_briefings_sender ON contact_briefings (account_id, sender_id);
+
+-- ---------------------------------------------------------------------------
+-- Contact Intelligence — notes, tags, relationship status
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS contact_notes (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,
+  note        TEXT NOT NULL,
+  created_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_notes_sender ON contact_notes (account_id, sender_id);
+
+CREATE TABLE IF NOT EXISTS contact_tags (
+  account_id  TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,
+  tag         TEXT NOT NULL,
+  PRIMARY KEY (account_id, sender_id, tag)
+);
+
+CREATE TABLE IF NOT EXISTS contact_status (
+  account_id  TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK(status IN ('warm', 'neutral', 'dormant', 'needs-follow-up')),
+  updated_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  PRIMARY KEY (account_id, sender_id)
+);
+
+-- ---------------------------------------------------------------------------
+-- Follow-ups & Snooze
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS follow_ups (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  tg_chat_id  TEXT NOT NULL,
+  message_id  BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+  remind_at   BIGINT NOT NULL,  -- Unix epoch seconds
+  note        TEXT,
+  dismissed   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS follow_ups_account_remind ON follow_ups(account_id, remind_at) WHERE NOT dismissed;
+
+-- ---------------------------------------------------------------------------
+-- Saved Searches — per-account stored filter presets
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  query       TEXT,
+  sender_id   TEXT,
+  chat_type   TEXT,   -- 'dm', 'group', 'channel', null (all)
+  media_type  TEXT,   -- 'photo', 'video', 'document', 'voice', null (all)
+  date_from   BIGINT,
+  date_to     BIGINT,
+  created_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_searches_account ON saved_searches (account_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Links — extracted URLs from ingested messages
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS links (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  tg_chat_id  TEXT NOT NULL,
+  message_id  BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+  sender_id   TEXT NOT NULL,
+  url         TEXT NOT NULL,
+  domain      TEXT NOT NULL,
+  sent_at     BIGINT NOT NULL,
+  bookmarked  BOOLEAN NOT NULL DEFAULT FALSE,
+  tag         TEXT,
+  created_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  UNIQUE (account_id, message_id, url)
+);
+
+CREATE INDEX IF NOT EXISTS links_account_sent   ON links(account_id, sent_at DESC);
+CREATE INDEX IF NOT EXISTS links_account_domain ON links(account_id, domain);
+CREATE INDEX IF NOT EXISTS links_account_chat   ON links(account_id, tg_chat_id);

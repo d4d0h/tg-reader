@@ -7,11 +7,20 @@ import {
   fetchHistory, fetchAuditLog,
   fetchTokens, revokeToken, createToken, fetchRoles,
   fetchInsight,
+  fetchFollowUps, fetchOverdueChats, createFollowUp, dismissFollowUp,
+  fetchContactProfile, fetchContactMessages, addContactNote, deleteContactNote,
+  setContactTags, setContactStatus,
+  fetchContactBriefing, generateContactBriefing,
+  fetchSavedSearches, createSavedSearch, deleteSavedSearch,
+  fetchLinks, bookmarkLink, tagLink,
   PAGE_SIZE,
   type AuthConfig, type Stats, type Message, type Chat, type Contact, type BackfillJob,
   type Job, type ChatConfig, type GlobalConfig, type HistoryResult, type AuditEntry, type CreateJobPayload,
   type AgentToken, type Role, type CreateTokenPayload, type TokenAccount,
-  type ChatInsight,
+  type ChatInsight, type FollowUp, type OverdueChat,
+  type ContactProfile, type ContactNote, type ContactStatusValue,
+  type ContactBriefing,
+  type SavedSearch, type LinkItem,
 } from './api'
 
 // ── Icons (inline SVG, zero dependency) ────────────────────────────────────
@@ -30,10 +39,12 @@ const icons = {
   automation: 'M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zm0 6v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',
   config:     'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
   tokens:     'M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4',
+  followups:  'M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',
+  links:      'M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71 M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71',
   logout:     'M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v1',
 }
 
-type Screen = 'overview' | 'search' | 'chats' | 'contacts' | 'automation' | 'config' | 'tokens'
+type Screen = 'overview' | 'search' | 'chats' | 'contacts' | 'automation' | 'config' | 'tokens' | 'followups' | 'links'
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 function fmtNum(n: number) {
@@ -144,13 +155,15 @@ function Sidebar({ screen, onNav, onLogout, accountId }: {
   accountId: string
 }) {
   const navItems: Array<{ id: Screen; label: string; icon: keyof typeof icons }> = [
-    { id: 'overview',   label: '// overview',   icon: 'overview' },
-    { id: 'search',     label: '// search',     icon: 'search' },
-    { id: 'chats',      label: '// chats',      icon: 'chats' },
-    { id: 'contacts',   label: '// contacts',   icon: 'contacts' },
-    { id: 'automation', label: '// automation', icon: 'automation' },
-    { id: 'tokens',     label: '// tokens',     icon: 'tokens' },
-    { id: 'config',     label: '// config',     icon: 'config' },
+    { id: 'overview',   label: '// overview',    icon: 'overview' },
+    { id: 'search',     label: '// search',      icon: 'search' },
+    { id: 'chats',      label: '// chats',       icon: 'chats' },
+    { id: 'followups',  label: '// follow-ups',  icon: 'followups' },
+    { id: 'links',      label: '// links',       icon: 'links' },
+    { id: 'contacts',   label: '// contacts',    icon: 'contacts' },
+    { id: 'automation', label: '// automation',  icon: 'automation' },
+    { id: 'tokens',     label: '// tokens',      icon: 'tokens' },
+    { id: 'config',     label: '// config',      icon: 'config' },
   ]
 
   return (
@@ -276,20 +289,60 @@ function Overview() {
 
 // ── Search ───────────────────────────────────────────────────────────────────
 function Search() {
+  // Core search state
   const [q, setQ] = useState('')
-  const [chatType, setChatType] = useState('')
   const [results, setResults] = useState<Message[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [searched, setSearched] = useState(false)
 
+  // Advanced filter state
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [filterSender, setFilterSender] = useState('')
+  const [filterChatType, setFilterChatType] = useState<'' | 'dm' | 'group' | 'channel'>('')
+  const [filterMediaType, setFilterMediaType] = useState<'' | 'photo' | 'video' | 'document' | 'voice'>('')
+  const [filterDateFrom, setFilterDateFrom] = useState('')
+  const [filterDateTo, setFilterDateTo] = useState('')
+
+  // Saved searches state
+  const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([])
+  const [saveName, setSaveName] = useState('')
+  const [saveFormOpen, setSaveFormOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetchSavedSearches().then(setSavedSearches).catch(() => {})
+  }, [])
+
+  const activeFilterCount = [filterSender, filterChatType, filterMediaType, filterDateFrom, filterDateTo].filter(Boolean).length
+  const hasActiveSearch = q.trim() !== '' || activeFilterCount > 0
+
+  function dateStrToEpoch(s: string): number | undefined {
+    if (!s) return undefined
+    const ts = Math.floor(new Date(s).getTime() / 1000)
+    return isNaN(ts) ? undefined : ts
+  }
+
+  function epochToDateStr(ts: number | null): string {
+    if (!ts) return ''
+    return new Date(ts * 1000).toISOString().slice(0, 10)
+  }
+
   const run = useCallback(async () => {
     setLoading(true)
     setError('')
     setSearched(true)
     try {
-      const r = await fetchMessages({ q: q || undefined, chat_type: chatType || undefined, limit: 50 })
+      const r = await fetchMessages({
+        q: q.trim() || undefined,
+        chat_type: filterChatType || undefined,
+        sender_id: filterSender.trim() || undefined,
+        media_type: filterMediaType || undefined,
+        date_from: dateStrToEpoch(filterDateFrom),
+        date_to: filterDateTo ? (dateStrToEpoch(filterDateTo)! + 86399) : undefined,
+        limit: 50,
+      })
       setResults(r.results)
       setTotal(r.total)
     } catch (err: any) {
@@ -297,35 +350,279 @@ function Search() {
     } finally {
       setLoading(false)
     }
-  }, [q, chatType])
+  }, [q, filterChatType, filterSender, filterMediaType, filterDateFrom, filterDateTo])
 
   function onKey(e: KeyboardEvent) {
     if (e.key === 'Enter') run()
   }
 
+  function clearFilters() {
+    setFilterSender('')
+    setFilterChatType('')
+    setFilterMediaType('')
+    setFilterDateFrom('')
+    setFilterDateTo('')
+  }
+
+  function applyAndRun() {
+    run()
+    setFiltersOpen(false)
+  }
+
+  async function handleSave() {
+    if (!saveName.trim()) return
+    setSaving(true)
+    try {
+      const res = await createSavedSearch({
+        name: saveName.trim(),
+        query: q.trim() || null,
+        sender_id: filterSender.trim() || null,
+        chat_type: filterChatType || null,
+        media_type: filterMediaType || null,
+        date_from: dateStrToEpoch(filterDateFrom) ?? null,
+        date_to: filterDateTo ? (dateStrToEpoch(filterDateTo)! + 86399) : null,
+      })
+      const newItem: SavedSearch = {
+        id: res.id,
+        name: saveName.trim(),
+        query: q.trim() || null,
+        sender_id: filterSender.trim() || null,
+        chat_type: filterChatType || null,
+        media_type: filterMediaType || null,
+        date_from: dateStrToEpoch(filterDateFrom) ?? null,
+        date_to: filterDateTo ? (dateStrToEpoch(filterDateTo)! + 86399) : null,
+        created_at: Math.floor(Date.now() / 1000),
+      }
+      setSavedSearches(prev => [newItem, ...prev])
+      setSaveName('')
+      setSaveFormOpen(false)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function handleDeleteSaved(id: string) {
+    try {
+      await deleteSavedSearch(id)
+      setSavedSearches(prev => prev.filter(s => s.id !== id))
+    } catch (err: any) {
+      setError(err.message)
+    }
+  }
+
+  function applySavedSearch(s: SavedSearch) {
+    const newQ = s.query ?? ''
+    const newSender = s.sender_id ?? ''
+    const newChatType = (s.chat_type ?? '') as '' | 'dm' | 'group' | 'channel'
+    const newMediaType = (s.media_type ?? '') as '' | 'photo' | 'video' | 'document' | 'voice'
+    const newDateFrom = epochToDateStr(s.date_from)
+    const newDateTo = epochToDateStr(s.date_to)
+    setQ(newQ)
+    setFilterSender(newSender)
+    setFilterChatType(newChatType)
+    setFilterMediaType(newMediaType)
+    setFilterDateFrom(newDateFrom)
+    setFilterDateTo(newDateTo)
+    setLoading(true)
+    setError('')
+    setSearched(true)
+    fetchMessages({
+      q: newQ || undefined,
+      chat_type: newChatType || undefined,
+      sender_id: newSender || undefined,
+      media_type: newMediaType || undefined,
+      date_from: s.date_from ?? undefined,
+      date_to: s.date_to ?? undefined,
+      limit: 50,
+    }).then(r => {
+      setResults(r.results)
+      setTotal(r.total)
+    }).catch((err: any) => setError(err.message))
+      .finally(() => setLoading(false))
+  }
+
+  const filterChips: Array<{ label: string; clear: () => void }> = []
+  if (filterSender) filterChips.push({ label: `sender: ${filterSender}`, clear: () => setFilterSender('') })
+  if (filterChatType) filterChips.push({ label: `type: ${filterChatType}`, clear: () => setFilterChatType('') })
+  if (filterMediaType) filterChips.push({ label: `media: ${filterMediaType}`, clear: () => setFilterMediaType('') })
+  if (filterDateFrom) filterChips.push({ label: `from: ${filterDateFrom}`, clear: () => setFilterDateFrom('') })
+  if (filterDateTo) filterChips.push({ label: `to: ${filterDateTo}`, clear: () => setFilterDateTo('') })
+
   return (
     <>
       <PageHeader eyebrow="// search" title="Message Search" />
       <div class="page-content">
+
+        {/* Saved search chips */}
+        {savedSearches.length > 0 && (
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px">
+            {savedSearches.map(s => (
+              <div key={s.id} style="display:inline-flex;align-items:center;gap:0;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <button
+                  style="background:none;border:none;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 8px;cursor:pointer"
+                  onClick={() => applySavedSearch(s)}
+                >
+                  {s.name}
+                </button>
+                <button
+                  style="background:none;border:none;border-left:1px solid var(--border);color:var(--text-muted);font-size:12px;padding:4px 7px;cursor:pointer;line-height:1"
+                  onClick={() => handleDeleteSaved(s.id)}
+                  title="delete saved search"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Main search row */}
         <div class="search-row">
           <input class="search-input" type="text" placeholder="search messages..."
-            value={q} onInput={(e: any) => setQ(e.target.value)} onKeyDown={onKey} />
-          <select class="search-input" value={chatType} onChange={(e: any) => setChatType(e.target.value)}>
-            <option value="">all types</option>
-            <option value="group">group</option>
-            <option value="supergroup">supergroup</option>
-            <option value="channel">channel</option>
-            <option value="private">private</option>
-          </select>
+            value={q} onInput={(e: any) => setQ(e.target.value)} onKeyDown={onKey} style="flex:1" />
+          <button
+            class="btn btn-ghost"
+            style={`font-family:'JetBrains Mono',monospace;font-size:12px;white-space:nowrap${filtersOpen ? ';background:var(--bg-card)' : ''}`}
+            onClick={() => setFiltersOpen(v => !v)}
+          >
+            {'// filters'}{activeFilterCount > 0 ? ` [${activeFilterCount}]` : ''}
+          </button>
           <button class="btn btn-primary" onClick={run} disabled={loading}>
             {loading ? <span class="spinner" /> : '// search'}
           </button>
         </div>
 
-        {error && <div class="form-error">&gt; {error}</div>}
+        {/* Active filter chips (shown when filters are collapsed) */}
+        {!filtersOpen && filterChips.length > 0 && (
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+            {filterChips.map(chip => (
+              <span
+                key={chip.label}
+                style="display:inline-flex;align-items:center;gap:4px;background:var(--bg-card);border:1px solid var(--accent,#3b82f6);border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent,#3b82f6);padding:2px 8px"
+              >
+                {chip.label}
+                <button
+                  style="background:none;border:none;color:inherit;cursor:pointer;font-size:13px;padding:0;line-height:1"
+                  onClick={chip.clear}
+                >×</button>
+              </span>
+            ))}
+            <button
+              style="background:none;border:none;color:var(--text-muted);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;padding:2px 4px"
+              onClick={clearFilters}
+            >clear all</button>
+          </div>
+        )}
+
+        {/* Expanded filter panel */}
+        {filtersOpen && (
+          <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:16px;margin-top:8px;display:flex;flex-direction:column;gap:14px">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+              <div class="form-group" style="margin:0">
+                <label class="form-label" style="font-size:10px">Sender ID / @username</label>
+                <input
+                  class="form-input"
+                  type="text"
+                  placeholder="e.g. 123456789 or @handle"
+                  value={filterSender}
+                  onInput={(e: any) => setFilterSender(e.target.value)}
+                />
+              </div>
+              <div class="form-group" style="margin:0">
+                <label class="form-label" style="font-size:10px">Media type</label>
+                <div style="display:flex;gap:4px;flex-wrap:wrap">
+                  {(['', 'photo', 'video', 'document', 'voice'] as const).map(v => (
+                    <button
+                      key={v || 'all'}
+                      style={`background:${filterMediaType === v ? 'var(--accent,#3b82f6)' : 'var(--bg-base)'};color:${filterMediaType === v ? '#fff' : 'var(--text-secondary)'};border:1px solid ${filterMediaType === v ? 'var(--accent,#3b82f6)' : 'var(--border)'};border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 10px;cursor:pointer`}
+                      onClick={() => setFilterMediaType(v)}
+                    >
+                      {v || 'all'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div class="form-group" style="margin:0">
+              <label class="form-label" style="font-size:10px">Chat type</label>
+              <div style="display:flex;gap:4px">
+                {(['', 'dm', 'group', 'channel'] as const).map(v => (
+                  <button
+                    key={v || 'all'}
+                    style={`background:${filterChatType === v ? 'var(--accent,#3b82f6)' : 'var(--bg-base)'};color:${filterChatType === v ? '#fff' : 'var(--text-secondary)'};border:1px solid ${filterChatType === v ? 'var(--accent,#3b82f6)' : 'var(--border)'};border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 14px;cursor:pointer`}
+                    onClick={() => setFilterChatType(v)}
+                  >
+                    {v || 'all'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+              <div class="form-group" style="margin:0">
+                <label class="form-label" style="font-size:10px">Date from</label>
+                <input class="form-input" type="date" value={filterDateFrom}
+                  onChange={(e: any) => setFilterDateFrom(e.target.value)} />
+              </div>
+              <div class="form-group" style="margin:0">
+                <label class="form-label" style="font-size:10px">Date to</label>
+                <input class="form-input" type="date" value={filterDateTo}
+                  onChange={(e: any) => setFilterDateTo(e.target.value)} />
+              </div>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <button
+                style="background:none;border:none;color:var(--text-muted);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;padding:0"
+                onClick={clearFilters}
+              >clear filters</button>
+              <button class="btn btn-primary" style="font-size:12px;padding:6px 18px" onClick={applyAndRun} disabled={loading}>
+                {loading ? <span class="spinner" /> : '// apply + search'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Save search */}
+        {hasActiveSearch && (
+          <div style="margin-top:10px">
+            {!saveFormOpen ? (
+              <button
+                style="background:none;border:none;color:var(--text-muted);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;padding:0;text-decoration:underline"
+                onClick={() => setSaveFormOpen(true)}
+              >+ save this search</button>
+            ) : (
+              <div style="display:flex;gap:8px;align-items:center">
+                <input
+                  class="form-input"
+                  type="text"
+                  placeholder="name this search..."
+                  value={saveName}
+                  onInput={(e: any) => setSaveName(e.target.value)}
+                  onKeyDown={(e: any) => { if (e.key === 'Enter') handleSave() }}
+                  style="flex:1;max-width:280px;font-size:12px"
+                  autoFocus
+                />
+                <button class="btn btn-primary" style="font-size:12px;padding:6px 14px"
+                  onClick={handleSave} disabled={saving || !saveName.trim()}>
+                  {saving ? <span class="spinner" /> : 'save'}
+                </button>
+                <button
+                  style="background:none;border:none;color:var(--text-muted);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer"
+                  onClick={() => { setSaveFormOpen(false); setSaveName('') }}
+                >cancel</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {error && <div class="form-error" style="margin-top:10px">&gt; {error}</div>}
 
         {searched && !loading && (
-          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary)">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);margin-top:12px">
             &gt; {fmtNum(total)} result{total !== 1 ? 's' : ''}
           </div>
         )}
@@ -340,6 +637,7 @@ function Search() {
             <div class="message-text">{m.text}</div>
             <div class="message-meta" style="margin-top:2px">
               <span class="muted mono">{m.sender_username ? `@${m.sender_username}` : m.sender_first_name || m.sender_id}</span>
+              {(m as any).media_type && <span class="badge badge-neutral" style="margin-left:6px">{(m as any).media_type}</span>}
             </div>
           </div>
         ))}
@@ -466,8 +764,26 @@ function Chats({ onSelectChat }: { onSelectChat: (id: string, name: string) => v
   )
 }
 
+// ── Status dot helper ─────────────────────────────────────────────────────
+const STATUS_COLORS: Record<string, string> = {
+  warm:             'var(--success,#10b981)',
+  neutral:          'var(--text-secondary)',
+  dormant:          'var(--warning,#f59e0b)',
+  'needs-follow-up':'var(--error,#ef4444)',
+}
+
+function StatusDot({ status }: { status: ContactStatusValue | null }) {
+  if (!status) return null
+  return (
+    <span
+      title={status}
+      style={`display:inline-block;width:7px;height:7px;border-radius:50%;background:${STATUS_COLORS[status] ?? 'var(--text-secondary)'};flex-shrink:0`}
+    />
+  )
+}
+
 // ── Contacts ──────────────────────────────────────────────────────────────
-function Contacts() {
+function Contacts({ onSelectContact }: { onSelectContact: (id: string) => void }) {
   const [contacts, setContacts] = useState<Contact[]>([])
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
@@ -542,7 +858,7 @@ function Contacts() {
                     <tr>
                       <th>Name</th>
                       <th>Username</th>
-                      <th>Phone</th>
+                      <th>Last active</th>
                       <th>Type</th>
                     </tr>
                   </thead>
@@ -551,8 +867,9 @@ function Contacts() {
                       ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
                       : contacts.map(c => {
                           const isMe = myAccountId !== '' && c.tg_user_id === myAccountId
+                          const lastSeen = (c as any).last_seen as number | null
                           return (
-                            <tr key={c.tg_user_id}>
+                            <tr key={c.tg_user_id} style="cursor:pointer" onClick={() => onSelectContact(c.tg_user_id)}>
                               <td>
                                 <div style="font-weight:500;display:flex;align-items:center;gap:6px">
                                   {[c.first_name, c.last_name].filter(Boolean).join(' ') || '(unnamed)'}
@@ -561,7 +878,7 @@ function Contacts() {
                                 <div class="muted mono" style="font-size:11px">{c.tg_user_id}</div>
                               </td>
                               <td class="mono accent">{c.username ? `@${c.username}` : '—'}</td>
-                              <td class="mono muted">{c.phone ?? '—'}</td>
+                              <td class="muted mono" style="font-size:12px">{lastSeen ? fmtTs(lastSeen) : '—'}</td>
                               <td>
                                 {c.is_bot
                                   ? <span class="badge badge-warning">bot</span>
@@ -588,8 +905,471 @@ function Contacts() {
   )
 }
 
+// ── ContactProfileView ────────────────────────────────────────────────────
+const STATUS_OPTIONS: ContactStatusValue[] = ['warm', 'neutral', 'dormant', 'needs-follow-up']
+
+function ContactProfileView({ senderId, onBack }: { senderId: string; onBack: () => void }) {
+  const [profile, setProfile] = useState<ContactProfile | null>(null)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [nextBeforeId, setNextBeforeId] = useState<number | null>(null)
+  const [loadingProfile, setLoadingProfile] = useState(true)
+  const [loadingMsgs, setLoadingMsgs] = useState(true)
+  const [loadingMoreMsgs, setLoadingMoreMsgs] = useState(false)
+  const [error, setError] = useState('')
+
+  // Tags editing
+  const [tagInput, setTagInput] = useState('')
+  const [savingTags, setSavingTags] = useState(false)
+
+  // Notes
+  const [noteInput, setNoteInput] = useState('')
+  const [savingNote, setSavingNote] = useState(false)
+  const [deletingNote, setDeletingNote] = useState<string | null>(null)
+
+  // Status
+  const [savingStatus, setSavingStatus] = useState(false)
+
+  // Briefing
+  const [briefing, setBriefing] = useState<ContactBriefing | null | 'loading'>('loading')
+  const [briefingProvider, setBriefingProvider] = useState('anthropic')
+  const [briefingModel, setBriefingModel] = useState(MODEL_PRESETS['anthropic'].model)
+  const [briefingApiKeyRef, setBriefingApiKeyRef] = useState(MODEL_PRESETS['anthropic'].api_key_ref)
+  const [generatingBriefing, setGeneratingBriefing] = useState(false)
+  const [briefingError, setBriefingError] = useState('')
+
+  useEffect(() => {
+    setLoadingProfile(true)
+    fetchContactProfile(senderId)
+      .then(p => setProfile(p))
+      .catch(err => setError(err.message))
+      .finally(() => setLoadingProfile(false))
+  }, [senderId])
+
+  useEffect(() => {
+    setBriefing('loading')
+    fetchContactBriefing(senderId)
+      .then(r => setBriefing(r.briefing))
+      .catch(() => setBriefing(null))
+  }, [senderId])
+
+  function onBriefingProviderChange(p: string) {
+    setBriefingProvider(p)
+    const preset = MODEL_PRESETS[p]
+    if (preset) { setBriefingModel(preset.model); setBriefingApiKeyRef(preset.api_key_ref) }
+  }
+
+  async function handleGenerateBriefing() {
+    setBriefingError('')
+    setGeneratingBriefing(true)
+    try {
+      const res = await generateContactBriefing(senderId, {
+        provider: briefingProvider,
+        model: briefingModel.trim(),
+        api_key_ref: briefingApiKeyRef.trim(),
+      })
+      setBriefing(res.briefing)
+    } catch (err: any) {
+      setBriefingError(err.message)
+    } finally {
+      setGeneratingBriefing(false)
+    }
+  }
+
+  useEffect(() => {
+    setLoadingMsgs(true)
+    fetchContactMessages(senderId, { limit: 50 })
+      .then(r => { setMessages(r.messages); setNextBeforeId(r.next_before_id) })
+      .catch(() => { /* non-critical */ })
+      .finally(() => setLoadingMsgs(false))
+  }, [senderId])
+
+  function loadMoreMsgs() {
+    if (!nextBeforeId) return
+    setLoadingMoreMsgs(true)
+    fetchContactMessages(senderId, { limit: 50, before_id: nextBeforeId })
+      .then(r => { setMessages(prev => [...prev, ...r.messages]); setNextBeforeId(r.next_before_id) })
+      .catch(() => { /* non-critical */ })
+      .finally(() => setLoadingMoreMsgs(false))
+  }
+
+  async function handleStatusChange(s: ContactStatusValue) {
+    if (!profile) return
+    setSavingStatus(true)
+    try {
+      await setContactStatus(senderId, s)
+      setProfile(prev => prev ? { ...prev, status: s } : prev)
+    } catch { /* non-critical */ } finally { setSavingStatus(false) }
+  }
+
+  async function handleAddTag(e: KeyboardEvent) {
+    if (e.key !== 'Enter' || !tagInput.trim() || !profile) return
+    const tag = tagInput.trim()
+    if (profile.tags.includes(tag)) { setTagInput(''); return }
+    const newTags = [...profile.tags, tag]
+    setSavingTags(true)
+    try {
+      await setContactTags(senderId, newTags)
+      setProfile(prev => prev ? { ...prev, tags: newTags } : prev)
+      setTagInput('')
+    } catch { /* non-critical */ } finally { setSavingTags(false) }
+  }
+
+  async function handleRemoveTag(tag: string) {
+    if (!profile) return
+    const newTags = profile.tags.filter(t => t !== tag)
+    setSavingTags(true)
+    try {
+      await setContactTags(senderId, newTags)
+      setProfile(prev => prev ? { ...prev, tags: newTags } : prev)
+    } catch { /* non-critical */ } finally { setSavingTags(false) }
+  }
+
+  async function handleAddNote() {
+    if (!noteInput.trim() || !profile) return
+    setSavingNote(true)
+    try {
+      const res = await addContactNote(senderId, noteInput.trim())
+      const newNote: ContactNote = { id: res.id, note: noteInput.trim(), created_at: res.created_at }
+      setProfile(prev => prev ? { ...prev, notes: [newNote, ...prev.notes] } : prev)
+      setNoteInput('')
+    } catch { /* non-critical */ } finally { setSavingNote(false) }
+  }
+
+  async function handleDeleteNote(noteId: string) {
+    setDeletingNote(noteId)
+    try {
+      await deleteContactNote(senderId, noteId)
+      setProfile(prev => prev ? { ...prev, notes: prev.notes.filter(n => n.id !== noteId) } : prev)
+    } catch { /* non-critical */ } finally { setDeletingNote(null) }
+  }
+
+  if (loadingProfile) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
+  if (error) return <div class="page-content"><div class="empty-state"><div class="empty-state-text">&gt; {error}</div></div></div>
+  if (!profile) return null
+
+  // Group messages by chat for display
+  type ChatGroup = { tg_chat_id: string; chat_name: string; messages: Message[] }
+  const chatGroups: ChatGroup[] = []
+  for (const m of messages) {
+    const last = chatGroups[chatGroups.length - 1]
+    if (last && last.tg_chat_id === m.tg_chat_id) {
+      last.messages.push(m)
+    } else {
+      chatGroups.push({ tg_chat_id: m.tg_chat_id, chat_name: m.chat_name || m.tg_chat_id, messages: [m] })
+    }
+  }
+
+  const sectionLabel = {
+    fontFamily: 'JetBrains Mono, monospace', fontSize: '10px', fontWeight: 700 as const,
+    letterSpacing: '1.5px', textTransform: 'uppercase' as const, color: 'var(--text-secondary)',
+    marginBottom: '8px',
+  }
+
+  return (
+    <>
+      <PageHeader eyebrow="// contacts" title={profile.display_name}>
+        <button class="btn btn-ghost" style="font-size:12px" onClick={onBack}>
+          ← back
+        </button>
+      </PageHeader>
+      <div class="page-content">
+
+        {/* Header meta row */}
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:24px;flex-wrap:wrap">
+          <span class="muted mono" style="font-size:12px">{profile.sender_id}</span>
+          <StatusDot status={profile.status} />
+          {profile.tags.map(t => (
+            <span key={t} class="badge badge-neutral" style="font-size:11px">{t}</span>
+          ))}
+        </div>
+
+        {/* Status picker */}
+        <section class="section">
+          <div style={sectionLabel as any}>Relationship Status</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            {STATUS_OPTIONS.map(s => (
+              <button
+                key={s}
+                class={`btn ${profile.status === s ? 'btn-primary' : 'btn-ghost'}`}
+                style={`font-size:11px;padding:4px 10px;display:flex;align-items:center;gap:5px;${profile.status === s ? '' : ''}`}
+                onClick={() => handleStatusChange(s)}
+                disabled={savingStatus}
+              >
+                <span style={`width:6px;height:6px;border-radius:50%;background:${STATUS_COLORS[s]};flex-shrink:0;display:inline-block`} />
+                {s}
+              </button>
+            ))}
+            {profile.status && (
+              <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;color:var(--text-secondary)"
+                onClick={() => handleStatusChange('neutral')} disabled={savingStatus}>
+                clear
+              </button>
+            )}
+          </div>
+        </section>
+
+        {/* Metrics row */}
+        <section class="section">
+          <div style={sectionLabel as any}>Metrics</div>
+          <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr))">
+            <div class="stat-card">
+              <div class="stat-label">Messages</div>
+              <div class="stat-value" style="font-size:22px">{fmtNum(profile.total_messages)}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Chats</div>
+              <div class="stat-value" style="font-size:22px">{fmtNum(profile.chats_count)}</div>
+            </div>
+            {profile.first_message_at && (
+              <div class="stat-card">
+                <div class="stat-label">First contact</div>
+                <div class="stat-value" style="font-size:14px">
+                  {new Date(profile.first_message_at * 1000).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
+                </div>
+              </div>
+            )}
+            {profile.avg_response_time_hrs !== null && (
+              <div class="stat-card">
+                <div class="stat-label">Avg response</div>
+                <div class="stat-value" style="font-size:22px">{profile.avg_response_time_hrs}h</div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Briefing panel */}
+        <section class="section">
+          <div style={sectionLabel as any}>// briefing</div>
+
+          {briefing === 'loading' && (
+            <div style="display:flex;justify-content:center;padding:16px">
+              <span class="spinner" />
+            </div>
+          )}
+
+          {briefing === null && (
+            <div style="display:flex;flex-direction:column;gap:12px">
+              <div style="font-size:12px;color:var(--text-secondary);line-height:1.6">
+                Generate an AI briefing across all chats with this contact.
+              </div>
+              <div style="display:flex;flex-direction:column;gap:10px;padding:12px 14px;border:1px solid var(--border);background:var(--surface)">
+                <div class="form-group" style="margin:0">
+                  <label class="form-label">Model</label>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <select class="form-input" style="width:140px" value={briefingProvider} onChange={(e: any) => onBriefingProviderChange(e.target.value)}>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="cloudflare">Cloudflare AI</option>
+                    </select>
+                    <input class="form-input" type="text" placeholder="model name"
+                      style="flex:1;min-width:160px;font-family:'JetBrains Mono',monospace;font-size:12px"
+                      value={briefingModel} onInput={(e: any) => setBriefingModel(e.target.value)} />
+                  </div>
+                </div>
+                <div class="form-group" style="margin:0">
+                  <label class="form-label">API key env var</label>
+                  <input class="form-input" type="text"
+                    style="font-family:'JetBrains Mono',monospace;font-size:12px"
+                    value={briefingApiKeyRef} onInput={(e: any) => setBriefingApiKeyRef(e.target.value)} />
+                </div>
+                {briefingError && <div class="form-error">&gt; {briefingError}</div>}
+                <button class="btn btn-primary" style="align-self:flex-start;font-size:12px" onClick={handleGenerateBriefing} disabled={generatingBriefing}>
+                  {generatingBriefing ? <span class="spinner" /> : '// generate briefing'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {briefing !== null && briefing !== 'loading' && (() => {
+            const d = briefing.data
+            const toneColor: Record<string, string> = {
+              warm: 'var(--success)',
+              neutral: 'var(--text-secondary)',
+              professional: 'var(--accent)',
+              tense: 'var(--error,#ef4444)',
+            }
+            return (
+              <div style="display:flex;flex-direction:column;gap:14px">
+                {/* Generated at + model + regenerate */}
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                  <div style="font-size:10px;color:var(--text-secondary);font-family:JetBrains Mono,monospace">
+                    {new Date(briefing.generated_at * 1000).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
+                    {' · '}{briefing.model}
+                  </div>
+                  <button
+                    class="btn btn-ghost"
+                    style="padding:2px 8px;font-size:10px;font-family:'JetBrains Mono',monospace"
+                    onClick={handleGenerateBriefing}
+                    disabled={generatingBriefing}
+                  >
+                    {generatingBriefing ? <span class="spinner" /> : '↻ regenerate'}
+                  </button>
+                </div>
+
+                {/* Tone badge */}
+                <div>
+                  <span style={`font-size:12px;font-weight:600;color:${toneColor[d.tone] ?? 'var(--text-primary)'};font-family:JetBrains Mono,monospace`}>
+                    {d.tone}
+                  </span>
+                </div>
+
+                {/* Summary */}
+                <div style="font-size:13px;color:var(--text-primary);line-height:1.65">{d.summary}</div>
+
+                {/* Topics */}
+                {d.topics && d.topics.length > 0 && (
+                  <div style="display:flex;flex-direction:column;gap:6px">
+                    <div style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-secondary)">Topics</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                      {d.topics.map(t => <span key={t} class="badge badge-neutral" style="font-size:11px">{t}</span>)}
+                    </div>
+                  </div>
+                )}
+
+                {/* Open threads */}
+                {d.open_threads && d.open_threads.length > 0 && (
+                  <div style="display:flex;flex-direction:column;gap:6px">
+                    <div style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-secondary)">Open threads</div>
+                    {d.open_threads.map((t, i) => (
+                      <div key={i} style="font-size:12px;color:var(--text-secondary);line-height:1.5;padding-left:8px;border-left:2px solid var(--border)">{t}</div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Agreed items */}
+                {d.agreed_items && d.agreed_items.length > 0 && (
+                  <div style="display:flex;flex-direction:column;gap:6px">
+                    <div style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-secondary)">Agreed</div>
+                    {d.agreed_items.map((a, i) => (
+                      <div key={i} style="font-size:12px;color:var(--text-primary);line-height:1.5;padding-left:8px;border-left:2px solid var(--accent)">{a}</div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Last sentiment */}
+                {d.last_sentiment && (
+                  <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;padding:8px 10px;border:1px solid var(--border);background:var(--surface)">
+                    {d.last_sentiment}
+                  </div>
+                )}
+
+                {/* Relationship arc */}
+                {d.relationship_arc && (
+                  <div style="font-size:12px;color:var(--text-secondary);line-height:1.6;font-style:italic">{d.relationship_arc}</div>
+                )}
+
+                {briefingError && <div class="form-error">&gt; {briefingError}</div>}
+              </div>
+            )
+          })()}
+        </section>
+
+        {/* Tags editor */}
+        <section class="section">
+          <div style={sectionLabel as any}>Tags</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px">
+            {profile.tags.map(t => (
+              <span key={t} style="display:inline-flex;align-items:center;gap:4px;background:var(--surface-alt,var(--surface));border:1px solid var(--border);padding:2px 8px;font-family:JetBrains Mono,monospace;font-size:11px">
+                {t}
+                <button
+                  style="background:none;border:none;cursor:pointer;color:var(--text-secondary);padding:0 0 0 2px;font-size:12px;line-height:1"
+                  onClick={() => handleRemoveTag(t)}
+                  disabled={savingTags}
+                >×</button>
+              </span>
+            ))}
+            <input
+              class="form-input"
+              style="width:120px;padding:2px 8px;font-size:12px;height:26px"
+              placeholder="add tag…"
+              value={tagInput}
+              onInput={(e: any) => setTagInput(e.target.value)}
+              onKeyDown={handleAddTag as any}
+            />
+          </div>
+          <div class="muted mono" style="font-size:10px">press Enter to add</div>
+        </section>
+
+        {/* Notes */}
+        <section class="section">
+          <div style={sectionLabel as any}>Notes ({profile.notes.length})</div>
+          <div style="display:flex;gap:8px;margin-bottom:12px">
+            <textarea
+              class="form-input"
+              style="flex:1;resize:vertical;min-height:60px;font-size:12px;font-family:JetBrains Mono,monospace"
+              placeholder="add a note…"
+              value={noteInput}
+              onInput={(e: any) => setNoteInput(e.target.value)}
+            />
+            <button class="btn btn-primary" style="align-self:flex-start;font-size:12px" onClick={handleAddNote} disabled={savingNote || !noteInput.trim()}>
+              {savingNote ? <span class="spinner" /> : 'add'}
+            </button>
+          </div>
+          {profile.notes.length === 0 ? (
+            <div class="muted mono" style="font-size:12px">&gt; no notes yet</div>
+          ) : (
+            <div style="display:flex;flex-direction:column;gap:8px">
+              {profile.notes.map(n => (
+                <div key={n.id} style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);background:var(--surface)">
+                  <div style="flex:1">
+                    <div style="font-size:13px;color:var(--text-primary);line-height:1.5;white-space:pre-wrap">{n.note}</div>
+                    <div class="muted mono" style="font-size:10px;margin-top:4px">{fmtTs(n.created_at)}</div>
+                  </div>
+                  <button
+                    class="btn btn-ghost"
+                    style="padding:2px 8px;font-size:11px;color:var(--error,#ef4444);border-color:var(--error,#ef4444);flex-shrink:0"
+                    onClick={() => handleDeleteNote(n.id)}
+                    disabled={deletingNote === n.id}
+                  >
+                    {deletingNote === n.id ? <span class="spinner" /> : '×'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Message history */}
+        <section class="section">
+          <div style={sectionLabel as any}>Message history</div>
+          {loadingMsgs ? (
+            <div class="empty-state"><span class="spinner" /></div>
+          ) : messages.length === 0 ? (
+            <div class="muted mono" style="font-size:12px">&gt; no messages found</div>
+          ) : (
+            <>
+              {chatGroups.map(cg => (
+                <div key={cg.tg_chat_id} style="margin-bottom:20px">
+                  <div style="font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--border)">
+                    {cg.chat_name}
+                  </div>
+                  {cg.messages.map(m => (
+                    <div key={m.id} class="message-card" style="margin-bottom:4px">
+                      <div class="message-meta">
+                        <span class="muted mono" style="font-size:11px">{fmtTs(m.sent_at)}</span>
+                      </div>
+                      <div class="message-text">{m.text || <span class="muted">[media]</span>}</div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+              {nextBeforeId && (
+                <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+                  onClick={loadMoreMsgs} disabled={loadingMoreMsgs}>
+                  {loadingMoreMsgs ? <span class="spinner" /> : '// load older'}
+                </button>
+              )}
+            </>
+          )}
+        </section>
+
+      </div>
+    </>
+  )
+}
+
 // ── InsightPanel ──────────────────────────────────────────────────────────
-function InsightPanel({ insight }: { insight: ChatInsight | null | 'loading' }) {
+function InsightPanel({ insight, onNavigate }: { insight: ChatInsight | null | 'loading'; onNavigate: (s: Screen) => void }) {
   const toneColor: Record<string, string> = {
     warm: 'var(--success)',
     neutral: 'var(--text-secondary)',
@@ -611,12 +1391,19 @@ function InsightPanel({ insight }: { insight: ChatInsight | null | 'loading' }) 
 
       {insight === null && (
         <div style="padding:20px;display:flex;flex-direction:column;gap:12px">
+          <div style="font-size:12px;color:var(--text-primary);font-weight:600;line-height:1.5">
+            AI insights not configured
+          </div>
           <div style="font-size:12px;color:var(--text-secondary);line-height:1.6">
-            No insights generated yet for this chat.
+            Set up a nightly insights job to analyse this conversation automatically.
           </div>
-          <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;font-family:JetBrains Mono,monospace">
-            Set up a nightly insights job in the Automation screen to analyse this conversation automatically.
-          </div>
+          <button
+            class="btn btn-ghost"
+            style="align-self:flex-start;font-size:11px;font-family:'JetBrains Mono',monospace;padding:4px 10px"
+            onClick={() => onNavigate('automation')}
+          >
+            &gt; configure
+          </button>
         </div>
       )}
 
@@ -711,7 +1498,7 @@ function InsightPanel({ insight }: { insight: ChatInsight | null | 'loading' }) 
 // ── ChatView ──────────────────────────────────────────────────────────────
 type BubbleGroup = { sender_id: string; senderLabel: string; isSelf: boolean; messages: Message[] }
 
-function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack: () => void }) {
+function ChatView({ chat, onBack, onNavigate }: { chat: { id: string; name: string }; onBack: () => void; onNavigate: (s: Screen) => void }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [nextAfterId, setNextAfterId] = useState<number | null>(null)
   const [nextAfterSentAt, setNextAfterSentAt] = useState<number | null>(null)
@@ -719,6 +1506,12 @@ function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
   const [insight, setInsight] = useState<ChatInsight | null | 'loading'>('loading')
+
+  // Snooze popover state
+  const [snoozeOpen, setSnoozeOpen] = useState(false)
+  const [snoozeNote, setSnoozeNote] = useState('')
+  const [snoozeSaving, setSnoozeSaving] = useState(false)
+  const [snoozeSuccess, setSnoozeSuccess] = useState(false)
 
   const accountId = getAuth()?.accountId ?? ''
 
@@ -753,6 +1546,25 @@ function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack
       .finally(() => setLoadingMore(false))
   }
 
+  async function handleSnooze(remindAt: number) {
+    setSnoozeSaving(true)
+    try {
+      await createFollowUp({ tg_chat_id: chat.id, remind_at: remindAt, note: snoozeNote.trim() || null })
+      setSnoozeSuccess(true)
+      setSnoozeOpen(false)
+      setSnoozeNote('')
+      setTimeout(() => setSnoozeSuccess(false), 2500)
+    } catch {
+      // silently ignore — non-critical
+    } finally {
+      setSnoozeSaving(false)
+    }
+  }
+
+  function snoozeTs(daysFromNow: number) {
+    return Math.floor(Date.now() / 1000) + daysFromNow * 86400
+  }
+
   if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
 
   // Group consecutive messages from the same sender
@@ -771,9 +1583,44 @@ function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack
   return (
     <>
       <PageHeader eyebrow="// chats" title={chat.name}>
-        <button class="btn btn-ghost" style="font-size:12px" onClick={onBack}>
-          ← back
-        </button>
+        <div style="display:flex;gap:8px;align-items:center;position:relative">
+          {snoozeSuccess && (
+            <span style="font-size:11px;color:var(--success,#10b981);font-family:JetBrains Mono,monospace">snoozed</span>
+          )}
+          <button class="btn btn-ghost" style="font-size:12px" onClick={() => setSnoozeOpen(o => !o)}>
+            // snooze
+          </button>
+          {snoozeOpen && (
+            <div style="position:absolute;top:calc(100% + 8px);right:0;z-index:100;background:var(--surface);border:1px solid var(--border);padding:16px;display:flex;flex-direction:column;gap:10px;min-width:240px">
+              <div style="font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary);letter-spacing:.5px">// snooze this chat</div>
+              <div style="display:flex;flex-direction:column;gap:6px">
+                {([['Tomorrow', 1], ['In 3 days', 3], ['Next week', 7]] as [string, number][]).map(([label, days]) => (
+                  <button key={label} class="btn btn-ghost" style="justify-content:flex-start;font-size:12px"
+                    onClick={() => handleSnooze(snoozeTs(days))} disabled={snoozeSaving}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                class="form-input"
+                style="font-size:12px;resize:vertical;min-height:56px"
+                placeholder="note (optional)"
+                value={snoozeNote}
+                onInput={(e: any) => setSnoozeNote(e.target.value)}
+              />
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-primary" style="flex:1;justify-content:center;font-size:12px"
+                  onClick={() => handleSnooze(snoozeTs(1))} disabled={snoozeSaving}>
+                  {snoozeSaving ? <span class="spinner" /> : 'Snooze'}
+                </button>
+                <button class="btn btn-ghost" style="font-size:12px" onClick={() => setSnoozeOpen(false)}>cancel</button>
+              </div>
+            </div>
+          )}
+          <button class="btn btn-ghost" style="font-size:12px" onClick={onBack}>
+            ← back
+          </button>
+        </div>
       </PageHeader>
       <div style="display:flex;flex:1;overflow:hidden">
         {/* Messages column */}
@@ -808,7 +1655,7 @@ function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack
           }
         </div>
         {/* Insights sidebar */}
-        <InsightPanel insight={insight} />
+        <InsightPanel insight={insight} onNavigate={onNavigate} />
       </div>
     </>
   )
@@ -1092,6 +1939,146 @@ function NewJobForm({ onCreated, onCancel }: { onCreated: (job: Job) => void; on
   )
 }
 
+// ── InsightsJobCard ────────────────────────────────────────────────────────
+function InsightsJobCard({ jobs, onJobCreated, onToggle, toggling }: {
+  jobs: Job[]
+  onJobCreated: (job: Job) => void
+  onToggle: (job: Job) => void
+  toggling: string | null
+}) {
+  const insightsJob = jobs.find(j => j.name.toLowerCase().includes('insight'))
+  const [enabled, setEnabled] = useState(false)
+  const [provider, setProvider] = useState('anthropic')
+  const [model, setModel] = useState(MODEL_PRESETS['anthropic'].model)
+  const [apiKeyRef, setApiKeyRef] = useState(MODEL_PRESETS['anthropic'].api_key_ref)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [created, setCreated] = useState<{ token: string; token_note: string } | null>(null)
+
+  function onProviderChange(p: string) {
+    setProvider(p)
+    const preset = MODEL_PRESETS[p]
+    if (preset) { setModel(preset.model); setApiKeyRef(preset.api_key_ref) }
+  }
+
+  async function handleCreate() {
+    setError('')
+    setSaving(true)
+    try {
+      const payload: CreateJobPayload = {
+        name: 'nightly-insights',
+        task_prompt: 'Analyse the recent messages in this chat and generate insights: tone, key topics, summary, relationship arc, follow-up suggestions, and unresolved threads.',
+        schedule: '0 8 * * *',
+        model_config: { provider, model: model.trim(), api_key_ref: apiKeyRef.trim() },
+      }
+      const res = await createJob(payload)
+      setCreated({ token: res.token, token_note: res.token_note })
+      onJobCreated({
+        id: res.job_id,
+        name: payload.name,
+        enabled: true,
+        schedule: '0 8 * * *',
+        trigger_type: null,
+        last_run_at: null,
+        cooldown_secs: 3600,
+        token_label: `job:${payload.name}`,
+      })
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (created) {
+    return (
+      <div style="border:1px solid var(--accent);border-radius:6px;padding:20px;display:flex;flex-direction:column;gap:12px">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent)">&gt; insights job created</div>
+        <div style="font-size:13px;font-weight:500">Save this token — it cannot be retrieved again:</div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:12px;word-break:break-all;user-select:all">
+          {created.token}
+        </div>
+        <div style="font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace">{created.token_note}</div>
+      </div>
+    )
+  }
+
+  if (insightsJob) {
+    return (
+      <div style="border:1px solid var(--border);border-radius:6px;padding:16px 20px;display:flex;flex-direction:column;gap:10px">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-secondary)">// ai insights</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <span style="font-size:13px;font-weight:500">{insightsJob.name}</span>
+            <span style="font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace">
+              last run: {insightsJob.last_run_at ? fmtTs(insightsJob.last_run_at) : 'never'}
+            </span>
+          </div>
+          <button
+            class={`btn ${insightsJob.enabled ? 'btn-primary' : 'btn-ghost'}`}
+            style="padding:4px 10px;font-size:11px"
+            onClick={() => onToggle(insightsJob)}
+            disabled={toggling === insightsJob.name}
+          >
+            {toggling === insightsJob.name ? <span class="spinner" /> : insightsJob.enabled ? 'on' : 'off'}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style="border:1px solid var(--border);border-radius:6px;padding:16px 20px;display:flex;flex-direction:column;gap:12px">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-secondary)">// ai insights</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <span style="font-size:13px;font-weight:500">Enable nightly AI insights</span>
+          <span style="font-size:11px;color:var(--text-secondary);line-height:1.5">
+            Analyses each conversation daily and surfaces tone, topics, and follow-up suggestions.
+          </span>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;flex-shrink:0">
+          <input type="checkbox" checked={enabled} onChange={(e: any) => setEnabled(e.target.checked)}
+            style="width:16px;height:16px;cursor:pointer;accent-color:var(--accent)" />
+        </label>
+      </div>
+      {enabled && (
+        <div style="display:flex;flex-direction:column;gap:10px;padding-top:4px;border-top:1px solid var(--border)">
+          <div class="form-group" style="margin:0">
+            <label class="form-label">Model</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <select class="form-input" style="width:140px" value={provider} onChange={(e: any) => onProviderChange(e.target.value)}>
+                <option value="anthropic">Anthropic</option>
+                <option value="openai">OpenAI</option>
+                <option value="cloudflare">Cloudflare AI</option>
+              </select>
+              <input class="form-input" type="text" placeholder="model name"
+                style="flex:1;min-width:160px;font-family:'JetBrains Mono',monospace;font-size:12px"
+                value={model} onInput={(e: any) => setModel(e.target.value)} />
+            </div>
+          </div>
+          <div class="form-group" style="margin:0">
+            <label class="form-label">API key env var</label>
+            <input class="form-input" type="text"
+              style="font-family:'JetBrains Mono',monospace;font-size:12px"
+              value={apiKeyRef} onInput={(e: any) => setApiKeyRef(e.target.value)} />
+            <div style="font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;margin-top:4px">
+              Name of the env var set in your Worker secrets
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace">
+            schedule: <span style="color:var(--text-primary)">daily 8am (0 8 * * *)</span>
+          </div>
+          {error && <div class="form-error">&gt; {error}</div>}
+          <button class="btn btn-primary" style="align-self:flex-start;font-size:12px" onClick={handleCreate} disabled={saving}>
+            {saving ? <span class="spinner" /> : '// create insights job'}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Automation() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
@@ -1158,6 +2145,12 @@ function Automation() {
 
         {tab === 'jobs' && (
           <div style="display:flex;flex-direction:column;gap:16px">
+            <InsightsJobCard
+              jobs={jobs}
+              onJobCreated={job => setJobs(prev => [...prev, job])}
+              onToggle={handleToggle}
+              toggling={toggling}
+            />
             {showForm && (
               <NewJobForm
                 onCreated={job => { setJobs(prev => [...prev, job]); }}
@@ -1811,11 +2804,417 @@ function Tokens() {
   )
 }
 
+// ── FollowUps ─────────────────────────────────────────────────────────────
+function FollowUps({ onSelectChat }: { onSelectChat: (id: string, name: string) => void }) {
+  const [overdue, setOverdue] = useState<OverdueChat[]>([])
+  const [snoozed, setSnoozed] = useState<FollowUp[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [dismissing, setDismissing] = useState<string | null>(null)
+
+  // Snooze popover state per overdue chat
+  const [snoozeOpenFor, setSnoozeOpenFor] = useState<string | null>(null)
+  const [snoozeNote, setSnoozeNote] = useState('')
+  const [snoozeSaving, setSnoozeSaving] = useState(false)
+
+  useEffect(() => {
+    setLoading(true)
+    Promise.all([fetchOverdueChats(), fetchFollowUps()])
+      .then(([o, s]) => { setOverdue(o); setSnoozed(s) })
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  async function handleDismiss(id: string) {
+    setDismissing(id)
+    try {
+      await dismissFollowUp(id)
+      setSnoozed(prev => prev.filter(f => f.id !== id))
+    } catch {
+      // non-critical
+    } finally {
+      setDismissing(null) }
+  }
+
+  async function handleSnoozeChat(chatId: string, daysFromNow: number) {
+    setSnoozeSaving(true)
+    try {
+      const remindAt = Math.floor(Date.now() / 1000) + daysFromNow * 86400
+      await createFollowUp({ tg_chat_id: chatId, remind_at: remindAt, note: snoozeNote.trim() || null })
+      const updated = await fetchFollowUps()
+      setSnoozed(updated)
+      setSnoozeOpenFor(null)
+      setSnoozeNote('')
+    } catch {
+      // non-critical
+    } finally {
+      setSnoozeSaving(false)
+    }
+  }
+
+  function fmtRemindAt(ts: number): string {
+    const now = Math.floor(Date.now() / 1000)
+    const diff = ts - now
+    if (diff < 0) {
+      const ago = -diff
+      if (ago < 3600) return `overdue ${Math.floor(ago / 60)}m ago`
+      if (ago < 86400) return `overdue ${Math.floor(ago / 3600)}h ago`
+      return `overdue ${Math.floor(ago / 86400)}d ago`
+    }
+    if (diff < 3600) return `in ${Math.floor(diff / 60)}m`
+    if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`
+    return `in ${Math.floor(diff / 86400)}d`
+  }
+
+  if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
+  if (error) return <div class="page-content"><div class="empty-state"><div class="empty-state-text">&gt; {error}</div></div></div>
+
+  return (
+    <>
+      <PageHeader eyebrow="// inbox" title="Follow-ups" />
+      <div class="page-content">
+
+        {/* Needs reply section */}
+        <section class="section">
+          <div class="section-label">needs reply ({overdue.length})</div>
+          {overdue.length === 0 ? (
+            <div class="empty-state"><div class="empty-state-text">&gt; all caught up</div></div>
+          ) : (
+            <div style="display:flex;flex-direction:column;gap:8px">
+              {overdue.map(c => (
+                <div key={c.tg_chat_id} style="background:var(--surface);border:1px solid var(--border);padding:14px 16px;display:flex;flex-direction:column;gap:8px">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="display:flex;flex-direction:column;gap:2px;min-width:0">
+                      <span style="font-family:JetBrains Mono,monospace;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                        {c.chat_name ?? c.tg_chat_id}
+                      </span>
+                      <span style="font-size:11px;color:var(--text-secondary);font-family:JetBrains Mono,monospace">
+                        {c.sender_display_name && `from ${c.sender_display_name} · `}{fmtTs(c.last_message_at)}
+                      </span>
+                    </div>
+                    <div style="display:flex;gap:6px;flex-shrink:0;position:relative">
+                      <button class="btn btn-ghost" style="font-size:11px;padding:3px 10px"
+                        onClick={() => onSelectChat(c.tg_chat_id, c.chat_name ?? c.tg_chat_id)}>
+                        open
+                      </button>
+                      <button class="btn btn-ghost" style="font-size:11px;padding:3px 10px"
+                        onClick={() => { setSnoozeOpenFor(snoozeOpenFor === c.tg_chat_id ? null : c.tg_chat_id); setSnoozeNote('') }}>
+                        snooze
+                      </button>
+                      {snoozeOpenFor === c.tg_chat_id && (
+                        <div style="position:absolute;top:calc(100% + 6px);right:0;z-index:100;background:var(--surface);border:1px solid var(--border);padding:14px;display:flex;flex-direction:column;gap:8px;min-width:220px">
+                          <div style="font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">// snooze</div>
+                          {([['Tomorrow', 1], ['In 3 days', 3], ['Next week', 7]] as [string, number][]).map(([label, days]) => (
+                            <button key={label} class="btn btn-ghost" style="justify-content:flex-start;font-size:12px"
+                              onClick={() => handleSnoozeChat(c.tg_chat_id, days)} disabled={snoozeSaving}>
+                              {label}
+                            </button>
+                          ))}
+                          <textarea class="form-input" style="font-size:12px;resize:vertical;min-height:48px"
+                            placeholder="note (optional)" value={snoozeNote}
+                            onInput={(e: any) => setSnoozeNote(e.target.value)} />
+                          <button class="btn btn-ghost" style="font-size:11px;align-self:flex-start" onClick={() => setSnoozeOpenFor(null)}>cancel</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  {c.snippet && (
+                    <div style="font-size:12px;color:var(--text-secondary);font-style:italic;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                      &ldquo;{c.snippet}&rdquo;
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Snoozed section */}
+        <section class="section">
+          <div class="section-label">snoozed ({snoozed.length})</div>
+          {snoozed.length === 0 ? (
+            <div class="empty-state"><div class="empty-state-text">&gt; no snoozed follow-ups</div></div>
+          ) : (
+            <div style="display:flex;flex-direction:column;gap:8px">
+              {snoozed.map(f => (
+                <div key={f.id} style={`background:var(--surface);border:1px solid ${f.is_overdue ? 'var(--error,#ef4444)' : 'var(--border)'};padding:14px 16px;display:flex;justify-content:space-between;align-items:flex-start;gap:8px`}>
+                  <div style="display:flex;flex-direction:column;gap:4px;min-width:0">
+                    <span style="font-family:JetBrains Mono,monospace;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                      {f.chat_name ?? f.tg_chat_id}
+                    </span>
+                    <span style={`font-size:11px;font-family:JetBrains Mono,monospace;color:${f.is_overdue ? 'var(--error,#ef4444)' : 'var(--text-secondary)'}`}>
+                      {fmtRemindAt(f.remind_at)}
+                    </span>
+                    {f.note && (
+                      <span style="font-size:12px;color:var(--text-secondary);font-style:italic">{f.note}</span>
+                    )}
+                  </div>
+                  <div style="display:flex;gap:6px;flex-shrink:0">
+                    <button class="btn btn-ghost" style="font-size:11px;padding:3px 10px"
+                      onClick={() => onSelectChat(f.tg_chat_id, f.chat_name ?? f.tg_chat_id)}>
+                      open
+                    </button>
+                    <button class="btn btn-ghost" style="font-size:11px;padding:3px 10px;color:var(--text-secondary)"
+                      onClick={() => handleDismiss(f.id)} disabled={dismissing === f.id}>
+                      {dismissing === f.id ? <span class="spinner" /> : 'dismiss'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+      </div>
+    </>
+  )
+}
+
+// ── Links ─────────────────────────────────────────────────────────────────
+function Links() {
+  const [links, setLinks] = useState<LinkItem[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [error, setError] = useState('')
+  const [hasMore, setHasMore] = useState(false)
+
+  // Filters
+  const [domainFilter, setDomainFilter] = useState('')
+  const [senderFilter, setSenderFilter] = useState('')
+  const [chatFilter, setChatFilter] = useState('')
+  const [bookmarkedOnly, setBookmarkedOnly] = useState(false)
+  const [qFilter, setQFilter] = useState('')
+
+  // Inline tag edit state
+  const [editingTag, setEditingTag] = useState<string | null>(null)
+  const [tagDraft, setTagDraft] = useState('')
+
+  const LIMIT = 50
+
+  const buildParams = useCallback((beforeId?: string) => ({
+    limit: LIMIT,
+    domain: domainFilter.trim() || undefined,
+    sender_id: senderFilter.trim() || undefined,
+    tg_chat_id: chatFilter.trim() || undefined,
+    bookmarked: bookmarkedOnly || undefined,
+    q: qFilter.trim() || undefined,
+    before_id: beforeId,
+  }), [domainFilter, senderFilter, chatFilter, bookmarkedOnly, qFilter])
+
+  function load() {
+    setLoading(true)
+    setError('')
+    fetchLinks(buildParams())
+      .then(data => {
+        setLinks(data)
+        setHasMore(data.length === LIMIT)
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false))
+  }
+
+  useEffect(() => { load() }, [domainFilter, senderFilter, chatFilter, bookmarkedOnly, qFilter])
+
+  function loadMore() {
+    if (links.length === 0) return
+    const lastId = links[links.length - 1].id
+    setLoadingMore(true)
+    fetchLinks(buildParams(lastId))
+      .then(data => {
+        setLinks(prev => [...prev, ...data])
+        setHasMore(data.length === LIMIT)
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoadingMore(false))
+  }
+
+  function handleBookmark(item: LinkItem) {
+    const next = !item.bookmarked
+    setLinks(prev => prev.map(l => l.id === item.id ? { ...l, bookmarked: next } : l))
+    bookmarkLink(item.id, next).catch(() => {
+      setLinks(prev => prev.map(l => l.id === item.id ? { ...l, bookmarked: item.bookmarked } : l))
+    })
+  }
+
+  function startEditTag(item: LinkItem) {
+    setEditingTag(item.id)
+    setTagDraft(item.tag ?? '')
+  }
+
+  function commitTag(item: LinkItem) {
+    const tag = tagDraft.trim() || null
+    setEditingTag(null)
+    setLinks(prev => prev.map(l => l.id === item.id ? { ...l, tag } : l))
+    tagLink(item.id, tag).catch(() => {
+      setLinks(prev => prev.map(l => l.id === item.id ? { ...l, tag: item.tag } : l))
+    })
+  }
+
+  function cancelEditTag() {
+    setEditingTag(null)
+    setTagDraft('')
+  }
+
+  return (
+    <>
+      <PageHeader eyebrow="// knowledge base" title="Links" />
+      <div class="page-content">
+        {/* Filter bar */}
+        <section class="section">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input
+              class="form-input"
+              style="width:150px;padding:6px 10px;font-size:12px"
+              placeholder="domain"
+              value={domainFilter}
+              onInput={(e: any) => setDomainFilter(e.target.value)}
+            />
+            <input
+              class="form-input"
+              style="width:150px;padding:6px 10px;font-size:12px"
+              placeholder="search URL"
+              value={qFilter}
+              onInput={(e: any) => setQFilter(e.target.value)}
+            />
+            <input
+              class="form-input"
+              style="width:150px;padding:6px 10px;font-size:12px"
+              placeholder="sender ID"
+              value={senderFilter}
+              onInput={(e: any) => setSenderFilter(e.target.value)}
+            />
+            <input
+              class="form-input"
+              style="width:150px;padding:6px 10px;font-size:12px"
+              placeholder="chat ID"
+              value={chatFilter}
+              onInput={(e: any) => setChatFilter(e.target.value)}
+            />
+            <button
+              class={`btn ${bookmarkedOnly ? 'btn-primary' : 'btn-ghost'}`}
+              style="padding:6px 12px;font-size:12px"
+              onClick={() => setBookmarkedOnly(b => !b)}
+            >
+              bookmarked only
+            </button>
+          </div>
+        </section>
+
+        {/* Results */}
+        {loading ? (
+          <div class="empty-state"><span class="spinner" /></div>
+        ) : error ? (
+          <div class="empty-state"><div class="empty-state-text">&gt; {error}</div></div>
+        ) : links.length === 0 ? (
+          <div class="empty-state">
+            <div class="empty-state-text">&gt; no links captured yet</div>
+          </div>
+        ) : (
+          <section class="section">
+            <div class="section-label">{links.length} link{links.length !== 1 ? 's' : ''}</div>
+            <div style="display:flex;flex-direction:column;gap:1px">
+              {links.map(item => (
+                <div
+                  key={item.id}
+                  style="padding:10px 12px;background:var(--bg-secondary);border-radius:4px;display:flex;gap:10px;align-items:flex-start"
+                >
+                  {/* Bookmark star */}
+                  <button
+                    style={`background:none;border:none;cursor:pointer;color:${item.bookmarked ? 'var(--accent)' : 'var(--muted)'};padding:0;flex-shrink:0;margin-top:1px`}
+                    onClick={() => handleBookmark(item)}
+                    title={item.bookmarked ? 'Remove bookmark' : 'Bookmark'}
+                  >
+                    <svg width="15" height="15" viewBox="0 0 24 24"
+                      fill={item.bookmarked ? 'currentColor' : 'none'}
+                      stroke="currentColor" strokeWidth="1.75"
+                      strokeLinecap="round" strokeLinejoin="round"
+                    >
+                      <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
+                    </svg>
+                  </button>
+
+                  {/* Main content */}
+                  <div style="flex:1;min-width:0">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px">
+                      <span class="badge badge-accent mono" style="font-size:10px">{item.domain}</span>
+                      {/* Tag chip / inline edit */}
+                      {editingTag === item.id ? (
+                        <span style="display:inline-flex;align-items:center;gap:4px">
+                          <input
+                            class="form-input"
+                            style="width:100px;padding:2px 6px;font-size:11px"
+                            value={tagDraft}
+                            placeholder="tag"
+                            autoFocus
+                            onInput={(e: any) => setTagDraft(e.target.value)}
+                            onKeyDown={(e: any) => {
+                              if (e.key === 'Enter') commitTag(item)
+                              if (e.key === 'Escape') cancelEditTag()
+                            }}
+                          />
+                          <button class="btn btn-primary" style="padding:2px 7px;font-size:11px" onClick={() => commitTag(item)}>ok</button>
+                          <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" onClick={cancelEditTag}>x</button>
+                        </span>
+                      ) : (
+                        <span
+                          class="muted mono"
+                          style="font-size:11px;cursor:pointer;border-bottom:1px dashed var(--border);padding-bottom:1px"
+                          onClick={() => startEditTag(item)}
+                          title="Click to edit tag"
+                        >
+                          {item.tag ?? '+ tag'}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* URL */}
+                    <a
+                      href={item.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="mono"
+                      style="font-size:12px;color:var(--accent);word-break:break-all;display:block;margin-bottom:4px;text-decoration:none"
+                      title={item.url}
+                    >
+                      {item.url.length > 90 ? item.url.slice(0, 90) + '…' : item.url}
+                    </a>
+
+                    {/* Meta */}
+                    <div class="muted mono" style="font-size:11px;display:flex;gap:8px;flex-wrap:wrap">
+                      {item.chat_name && <span>{item.chat_name}</span>}
+                      <span>{item.sender_display_name}</span>
+                      <span>{fmtTs(item.sent_at)}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {hasMore && (
+              <div style="margin-top:12px;text-align:center">
+                <button
+                  class="btn btn-ghost"
+                  style="font-size:12px"
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                >
+                  {loadingMore ? <span class="spinner" /> : 'load more'}
+                </button>
+              </div>
+            )}
+          </section>
+        )}
+      </div>
+    </>
+  )
+}
+
 // ── App ───────────────────────────────────────────────────────────────────
 export function App() {
   const [authed, setAuthed] = useState(() => !!getAuth())
   const [screen, setScreen] = useState<Screen>('overview')
   const [selectedChat, setSelectedChat] = useState<{ id: string; name: string } | null>(null)
+  const [selectedContact, setSelectedContact] = useState<string | null>(null)
 
   function onLogout() {
     clearAuth()
@@ -1825,6 +3224,7 @@ export function App() {
   function onNav(s: Screen) {
     setScreen(s)
     setSelectedChat(null)
+    setSelectedContact(null)
   }
 
   if (!authed) {
@@ -1838,7 +3238,18 @@ export function App() {
       <div class="layout">
         <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} />
         <main class="main">
-          <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} />
+          <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} onNavigate={(s) => { setSelectedChat(null); setScreen(s) }} />
+        </main>
+      </div>
+    )
+  }
+
+  if (selectedContact) {
+    return (
+      <div class="layout">
+        <Sidebar screen="contacts" onNav={onNav} onLogout={onLogout} accountId={accountId} />
+        <main class="main">
+          <ContactProfileView senderId={selectedContact} onBack={() => setSelectedContact(null)} />
         </main>
       </div>
     )
@@ -1848,12 +3259,15 @@ export function App() {
     switch (screen) {
       case 'chats':
         return <Chats onSelectChat={(id, name) => setSelectedChat({ id, name })} />
+      case 'followups':
+        return <FollowUps onSelectChat={(id, name) => setSelectedChat({ id, name })} />
       case 'overview':   return <Overview />
       case 'search':     return <Search />
-      case 'contacts':   return <Contacts />
+      case 'contacts':   return <Contacts onSelectContact={(id) => setSelectedContact(id)} />
       case 'automation': return <Automation />
       case 'tokens':     return <Tokens />
       case 'config':     return <Config />
+      case 'links':      return <Links />
     }
   }
 
