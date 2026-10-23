@@ -10,7 +10,7 @@ jobs:
   deploy-madhoneycub:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: flyctl deploy --app tg-reader --remote-only
         working-directory: gramjs
@@ -20,7 +20,7 @@ jobs:
   deploy-main:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: flyctl deploy --app tg-reader-main --remote-only
         working-directory: gramjs
