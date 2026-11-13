@@ -176,10 +176,12 @@ export async function handleIngest(request: Request, env: Env, accountId: string
 
   // H2 (#98): dedupe by conflict key, last occurrence wins. A duplicate
   // (tg_chat_id, tg_message_id) inside one UNNEST batch would otherwise abort
-  // the whole statement ("cannot affect row a second time") and 500.
+  // the whole statement ("cannot affect row a second time") and 500. The key
+  // is a JSON pair — a plain `${chat}:${msg}` concatenation would be
+  // ambiguous for ids containing the separator.
   const msgs = dedupeByLast(
     messages as Message[],
-    m => `${m.tg_chat_id}:${m.tg_message_id}`,
+    m => JSON.stringify([m.tg_chat_id, m.tg_message_id]),
   );
 
   console.log(`[POST /ingest] account=${accountId} count=${messages.length} deduped=${msgs.length}`);
@@ -596,6 +598,15 @@ export async function handlePostContacts(request: Request, env: Env, accountId: 
     return json({ ok: false, error: 'contacts array must have 1–500 items' }, 400);
   }
 
+  // Per-item validation (mirrors /ingest): tg_user_id must be a string, or
+  // mixed number/string forms of the same id would defeat the dedupe key.
+  for (let i = 0; i < contacts.length; i++) {
+    const c = contacts[i] as Record<string, unknown>;
+    if (typeof c.tg_user_id !== 'string') {
+      return json({ ok: false, error: `contacts[${i}].tg_user_id must be a string (Telegram ids are 64-bit)` }, 400);
+    }
+  }
+
   // H2 (#98): one conflict key twice inside a single UNNEST batch aborts the
   // whole statement — dedupe first, last occurrence wins.
   const cs = dedupeByLast(contacts as ContactPayload[], c => c.tg_user_id);
@@ -660,7 +671,10 @@ export async function handlePostContacts(request: Request, env: Env, accountId: 
   }
 
   console.log(`[POST /contacts] inserted=${inserted} updated=${updated}`);
-  return json({ upserted: inserted + updated });
+  // The UPDATE statement touches every row in the (deduped) batch — including
+  // the ones the INSERT just created — so its rowCount is the distinct-contact
+  // count, matching the old single-statement upsert's semantics.
+  return json({ upserted: updated });
 }
 
 async function handleGetContacts(request: Request, env: Env, accountId: string): Promise<Response> {
@@ -2723,14 +2737,13 @@ async function handleMcpMessage(
   }
 
   if (method === 'initialize') {
-    return {
-      jsonrpc: '2.0',
-      id,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'tg-reader', version: '1.0.0' },
-        instructions: `You have full read/write access to a Telegram archive (51k+ messages, 205 chats). All timestamps are Unix epoch seconds.
+    // Scope-aware playbook: scoped agent tokens are denied the address book
+    // (contacts/address_book), stats and outbox_status (see MASTER_ONLY_TOOLS),
+    // so the instructions must not steer them there — "senders" is the
+    // read-scoped people lookup they can always use.
+    const master = ctx.role === null;
+    const peopleTool = master ? '"contacts" (full address book) or "senders"' : '"senders"';
+    const instructions = `You have ${master ? 'full read/write access' : 'scoped access (your token has a role with read/write limits)'} to a Telegram archive. All timestamps are Unix epoch seconds.
 
 TOOL SELECTION — pick the right tool first time:
 - User asks about a past conversation, event, person, amount, decision → "search" (always start here)
@@ -2738,8 +2751,8 @@ TOOL SELECTION — pick the right tool first time:
 - User asks "what's new" or "latest messages" → "digest(hours=1)" not "recent" (digest groups by chat, recent is a flat dump)
 - User wants to browse one chat chronologically → "history" (get chat_id from "chats" first)
 - User mentions a specific reply chain or wants context around one message → "thread"
-- User asks about a person → "contacts" to find username, then "search" with sender_username
-- User asks about archive size or date range → "stats"
+- User asks about a person → ${peopleTool} to find username, then "search" with sender_username
+${master ? '- User asks about archive size or date range → "stats"' : '- Note: "contacts", "stats" and "outbox_status" are reserved for the master token — a permission_denied there is expected'}
 
 SEARCH TIPS:
 - Multiple words are ANDed — use words likely to appear verbatim
@@ -2765,16 +2778,24 @@ AGENTIC WORKFLOWS:
   3. draft() a summary or send() a reminder if needed
 
 "Catch up on a person":
-  1. contacts(search="name") — find their username
+  1. ${master ? 'contacts(search="name")' : 'senders(search="name")'} — find their username
   2. search(query="", sender_username="their_username") — all their messages
   3. digest to see recent context in shared chats
 
 "Prepare a mass send":
-  1. contacts() — get recipient list
+  1. ${master ? 'contacts()' : 'senders()'} — get recipient list
   2. draft(text="Hi {first_name}...", recipients=[...]) — save draft
   3. Review, then POST /outbox/:id/send to promote
 
-IMPORTANT: The archive is complete — never say data is unavailable. Try broader search terms or a wider date range before giving up.`,
+IMPORTANT: The archive is complete — never say data is unavailable. Try broader search terms or a wider date range before giving up.`;
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'tg-reader', version: '1.0.0' },
+        instructions,
       },
     };
   }
@@ -3794,7 +3815,7 @@ const JOB_DEADLINE_MS = 60_000; // 60s wall-clock max per job loop
 // Management tools plus the read tools that cannot be scoped per chat:
 // address_book/contacts (every contact incl. phone numbers), stats
 // (account-wide aggregates), outbox_status (full draft text by sequential id).
-const MASTER_ONLY_TOOLS = new Set([
+export const MASTER_ONLY_TOOLS = new Set([
   'create_role', 'list_roles', 'update_role', 'delete_role',
   'create_token', 'list_tokens', 'revoke_token',
   'create_job', 'list_jobs', 'toggle_job', 'delete_job', 'update_job',

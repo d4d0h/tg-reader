@@ -96,11 +96,48 @@ describe('POST /contacts (#97)', () => {
       ACCOUNT,
     );
     expect(res.status).toBe(200);
+    const body = (await res.json()) as { upserted: number };
+    expect(body.upserted).toBe(1);
     const { rows } = await pool.query<{ username: string }>(
       `SELECT username FROM contacts WHERE tg_user_id = '4'`,
     );
     expect(rows).toHaveLength(1);
     expect(rows[0]!.username).toBe('second');
+  });
+
+  it('reports distinct contacts, not inserted+updated double-counted', async () => {
+    const fresh = await handlePostContacts(
+      post('/contacts', {
+        contacts: [
+          { tg_user_id: '5', username: 'x' },
+          { tg_user_id: '6', username: 'y' },
+        ],
+      }),
+      env,
+      ACCOUNT,
+    );
+    expect(((await fresh.json()) as { upserted: number }).upserted).toBe(2);
+
+    const repeat = await handlePostContacts(
+      post('/contacts', {
+        contacts: [
+          { tg_user_id: '5', username: 'x' },
+          { tg_user_id: '6', username: 'y' },
+        ],
+      }),
+      env,
+      ACCOUNT,
+    );
+    expect(((await repeat.json()) as { upserted: number }).upserted).toBe(2);
+  });
+
+  it('rejects a non-string tg_user_id with 400, not a 500', async () => {
+    const res = await handlePostContacts(
+      post('/contacts', { contacts: [{ tg_user_id: 12345 }] }),
+      env,
+      ACCOUNT,
+    );
+    expect(res.status).toBe(400);
   });
 });
 

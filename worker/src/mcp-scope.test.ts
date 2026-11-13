@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { dispatchMcpTool } from './index';
+import { dispatchMcpTool, MASTER_ONLY_TOOLS } from './index';
+import { MCP_TOOL_DEFINITIONS } from './mcp-tools';
 import type { Env, RoleRow, TokenContext } from './types';
 
 // The dispatch-entry guard runs before any tool implementation, so no
@@ -40,5 +41,25 @@ describe('master-only MCP tools (#99, #100)', () => {
       error?: string;
     };
     expect(result.error).toBe('permission_denied');
+  });
+});
+
+describe('MASTER_ONLY_TOOLS advertisement', () => {
+  it('covers the unscoped read tools and the management tools', () => {
+    for (const name of ['address_book', 'contacts', 'stats', 'outbox_status', 'create_token', 'create_role']) {
+      expect(MASTER_ONLY_TOOLS.has(name)).toBe(true);
+    }
+  });
+
+  it('hides every advertised master-only tool from the scoped tools/list filter', () => {
+    // The tools/list filter is `!MASTER_ONLY_TOOLS.has(t.name)` for scoped
+    // tokens, so any advertised tool in the set disappears from their list.
+    const advertisedMasterOnly = MCP_TOOL_DEFINITIONS.filter(t => MASTER_ONLY_TOOLS.has(t.name));
+    expect(advertisedMasterOnly.map(t => t.name)).toContain('address_book');
+    expect(advertisedMasterOnly.map(t => t.name)).toContain('stats');
+  });
+
+  it('does not advertise the deprecated contacts alias at all', () => {
+    expect(MCP_TOOL_DEFINITIONS.some(t => t.name === 'contacts')).toBe(false);
   });
 });
