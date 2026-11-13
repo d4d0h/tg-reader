@@ -61,16 +61,40 @@ describe('duplicate handling (#101)', () => {
   it('appends an edit whose original is inside the in-flight batch (edit-during-flush race)', async () => {
     const { store, post } = setup();
     let release!: () => void;
-    post.mockImplementation(
+    post.mockImplementationOnce(
       () => new Promise<boolean>(resolve => { release = () => resolve(true); }),
-    );
+    ).mockResolvedValue(true);
     await store.enqueue(msg('1', 'v1'), true);
     const flushPromise = store.flush(); // POST now in flight with v1
     await store.enqueue(msg('1', 'v2'), true); // edit arrives mid-flight
+    expect(store.pending()).toBe(2); // appended, not replaced inside the window
     release();
     await flushPromise;
-    expect(store.pending()).toBe(1); // v2 survives the post-delivery removal
-    expect(store.snapshot()[0]!.text).toBe('v2');
+    // v1 delivered first, then the drain delivers v2 — the edit is never lost.
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[0]![0][0]!.text).toBe('v1');
+    expect(post.mock.calls[1]![0][0]!.text).toBe('v2');
+    expect(store.pending()).toBe(0);
+  });
+});
+
+describe('draining (re-review: stalled bursts and restored backlogs)', () => {
+  it('one flush call drains a backlog larger than a batch', async () => {
+    const { store, post } = setup({ batchSize: 100 });
+    post.mockResolvedValue(true);
+    store.restore(Array.from({ length: 250 }, (_, i) => msg(`r-${i}`, `t${i}`)));
+    await store.flush(); // the single boot-restore flush
+    expect(post).toHaveBeenCalledTimes(3); // 100 + 100 + 50
+    expect(store.pending()).toBe(0);
+  });
+
+  it('stops draining at a batch that fails and stays queued', async () => {
+    const { store, post } = setup({ batchSize: 10 });
+    post.mockResolvedValueOnce(true).mockResolvedValue(false);
+    store.restore(Array.from({ length: 25 }, (_, i) => msg(`r-${i}`, `t${i}`)));
+    await store.flush();
+    expect(post).toHaveBeenCalledTimes(2); // first delivered, second rejected -> stop
+    expect(store.pending()).toBe(15);
   });
 });
 
@@ -118,15 +142,19 @@ describe('poison batches and the cap (#104)', () => {
     release();
     await tenth;
 
-    // In-flight batch delivered exactly once, pending remainder intact — nothing lost.
+    // In-flight batch delivered exactly once; the drain then delivers every
+    // surviving pending entry — nothing lost, nothing duplicated.
     expect(post.mock.calls[0]![0].map(m => m.tg_message_id)).toEqual(
       Array.from({ length: 10 }, (_, i) => `inflight-${i}`),
     );
-    expect(store.pending()).toBe(105);
-    const survivors = store.snapshot().map(m => m.tg_message_id);
-    expect(survivors[0]).toBe('pending-10');
-    expect(survivors).not.toContain('pending-0');
-    expect(survivors).not.toContain('inflight-0');
+    const delivered = post.mock.calls.flatMap(call => call[0].map(m => m.tg_message_id));
+    expect(delivered.filter(id => id === 'inflight-0')).toHaveLength(1);
+    expect(delivered).not.toContain('pending-0'); // dead-lettered, not delivered
+    expect(delivered).toContain('pending-10');
+    expect(delivered).toContain('pending-114');
+    expect(new Set(delivered).size).toBe(delivered.length); // no duplicates
+    expect(delivered).toHaveLength(10 + 105);
+    expect(store.pending()).toBe(0);
   });
 });
 

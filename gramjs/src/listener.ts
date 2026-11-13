@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { randomBytes } from 'crypto';
 import bigInt from 'big-integer';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
@@ -358,25 +359,36 @@ function persistBuffer(): Promise<void> {
 // H5 (#104): dead-letter records messages to disk with the reason, so a
 // poison batch is never silently dropped. Returns false when the file could
 // not be written — callers must then KEEP the messages in memory.
+// The filename carries a random suffix and the write uses 'wx': two
+// dead-letter writes starting in the same millisecond must NEVER share a
+// file (the re-review probe showed a shared name silently overwrites one
+// batch while both callers splice).
 async function deadLetterBatch(batch: Message[], reason: string): Promise<boolean> {
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = `/data/deadletter-${stamp}.ndjson`;
-  try {
-    const lines = batch.map(m => JSON.stringify({ reason, ...m })).join('\n') + '\n';
-    await fs.promises.writeFile(file, lines, 'utf-8');
-    console.error(
-      `[ingest] DEAD-LETTERED ${batch.length} message(s) to ${file} (${reason}) — ` +
-        'replay with the backfill tool if needed',
-    );
-    return true;
-  } catch (err) {
-    console.error(
-      `[ingest] could not write dead-letter file ${file}:`,
-      err instanceof Error ? err.message : String(err),
-      '— keeping messages in memory',
-    );
-    return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = `/data/deadletter-${stamp}-${randomBytes(4).toString('hex')}.ndjson`;
+    try {
+      const lines = batch.map(m => JSON.stringify({ reason, ...m })).join('\n') + '\n';
+      await fs.promises.writeFile(file, lines, { encoding: 'utf-8', flag: 'wx' });
+      console.error(
+        `[ingest] DEAD-LETTERED ${batch.length} message(s) to ${file} (${reason}) — ` +
+          'replay with the backfill tool if needed',
+      );
+      return true;
+    } catch (err) {
+      if (attempt === 1) {
+        console.error(
+          `[ingest] could not write dead-letter file:`,
+          err instanceof Error ? err.message : String(err),
+          '— keeping messages in memory',
+        );
+        return false;
+      }
+      // EEXIST (astronomically unlikely with the random suffix) or a
+      // transient error — retry once with a fresh name.
+    }
   }
+  return false;
 }
 
 function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.TypeUser[]): Message {
@@ -556,7 +568,7 @@ async function persistPts(client: TelegramClient, force = false): Promise<void> 
   // Also never advance while a gap recovery is mid-flight (its own exits
   // persist deliberately via force); a 60s tick landing mid-recovery would
   // otherwise skip the unrecovered remainder.
-  if (!force && (bufferStore.pending() > 0 || gapRecoveryRunning)) return;
+  if (!force && (bufferStore.pending() > 0 || gapRecoveryRunning || reconnectCheckRunning)) return;
   try {
     const state = await client.invoke(new Api.updates.GetState());
     await savePtsState({ pts: state.pts, qts: state.qts }); // L-5: persist both
@@ -932,8 +944,18 @@ async function main(): Promise<void> {
         parseErr instanceof Error ? parseErr.message : String(parseErr),
       );
     }
-  } catch {
-    // no buffer file — normal after a clean shutdown
+  } catch (err) {
+    // ENOENT = no buffer file, normal after a clean shutdown. Anything else
+    // (EACCES, EIO on the volume) means a backlog may exist but was NOT
+    // restored — say so loudly instead of looking like a clean boot.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'ENOENT') {
+      console.error(
+        `[buffer] could not read ${BUFFER_FILE} (${code ?? 'unknown error'}) — any persisted backlog was NOT restored; ` +
+          'the file is left in place for manual recovery:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 
   // 4. Gap recovery — advance the pts baseline only when recovery ended clean

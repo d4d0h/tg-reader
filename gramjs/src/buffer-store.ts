@@ -41,25 +41,43 @@ export function createBufferStore(deps: BufferStoreDeps) {
   let flushingBatchLen = 0; // leading entries currently inside the in-flight POST
   let consecutiveFailures = 0;
 
-  /** Deliver the leading pending batch, if any. */
+  /**
+   * Deliver pending entries, one batch at a time, until the buffer is empty
+   * or a batch fails and stays queued. Draining in one call matters: every
+   * trigger (the >= batchSize enqueue, the debounce timer, the single
+   * boot-restore flush) can be consumed while a POST is in flight, and
+   * nothing re-arms them — a single-batch flush left the remainder of a
+   * burst or a restored backlog undelivered until the next live message
+   * (re-review probe).
+   */
   async function flush(): Promise<void> {
     if (flushing || buffer.length === 0) return;
     flushing = true;
-    // Entries stay in the buffer until delivery is confirmed. The snapshot is
-    // by count — which is only safe because nothing else may remove or replace
-    // entries inside the in-flight window while the POST is in flight.
-    const batch = buffer.slice(0, batchSize);
-    flushingBatchLen = batch.length;
     try {
-      const ok = await deps.post(batch);
-      if (ok) {
-        buffer.splice(0, batch.length);
-        consecutiveFailures = 0;
-      } else {
-        await handleFailure(batch, 'worker rejected batch');
+      while (buffer.length > 0) {
+        // Entries stay in the buffer until delivery is confirmed. The snapshot
+        // is by count — safe only because nothing else may remove or replace
+        // entries inside the in-flight window while the POST is in flight.
+        const batch = buffer.slice(0, batchSize);
+        flushingBatchLen = batch.length;
+        let ok = false;
+        let reason = 'worker rejected batch';
+        try {
+          ok = await deps.post(batch);
+        } catch (err) {
+          reason = `fetch error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        if (ok) {
+          buffer.splice(0, batch.length);
+          consecutiveFailures = 0;
+        } else {
+          const removed = await handleFailure(batch, reason);
+          // Still queued: stop here and retry on the next trigger rather
+          // than hammering a worker that is down.
+          if (!removed) break;
+        }
+        flushingBatchLen = 0;
       }
-    } catch (err) {
-      await handleFailure(batch, `fetch error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       flushing = false;
       flushingBatchLen = 0;
@@ -67,7 +85,8 @@ export function createBufferStore(deps: BufferStoreDeps) {
     }
   }
 
-  async function handleFailure(batch: Message[], reason: string): Promise<void> {
+  /** Returns true when the batch was dead-lettered and removed from the buffer. */
+  async function handleFailure(batch: Message[], reason: string): Promise<boolean> {
     consecutiveFailures++;
     if (consecutiveFailures >= maxFlushFailures) {
       const persisted = await deps.deadLetter(
@@ -77,12 +96,12 @@ export function createBufferStore(deps: BufferStoreDeps) {
       if (persisted) {
         buffer.splice(0, batch.length);
         consecutiveFailures = 0;
+        return true;
       }
+      return false;
     }
-    // Retries (and the no-op case) log at the caller's level via the reason.
-    else {
-      console.error(`[ingest] ${reason} — will retry on next flush (${consecutiveFailures}/${maxFlushFailures})`);
-    }
+    console.error(`[ingest] ${reason} — will retry on next flush (${consecutiveFailures}/${maxFlushFailures})`);
+    return false;
   }
 
   /**

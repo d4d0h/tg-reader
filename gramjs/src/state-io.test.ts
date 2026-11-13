@@ -70,8 +70,16 @@ describe('createPtsStateIo', () => {
   it('writes atomically — no .tmp left behind and the target is never partial', async () => {
     const io = createPtsStateIo('/data/state.json', fs);
     await io.save({ pts: 5, qts: 1 });
-    expect(fs.files.has('/data/state.json.tmp')).toBe(false);
+    expect([...fs.files.keys()].filter(k => k.endsWith('.tmp'))).toEqual([]);
     expect(fs.files.get('/data/state.json')).toBe(JSON.stringify({ pts: 5, qts: 1 }));
+  });
+
+  it('concurrent saves do not lose each other to a shared tmp file (re-review)', async () => {
+    const io = createPtsStateIo('/data/state.json', fs);
+    await Promise.all(Array.from({ length: 20 }, (_, i) => io.save({ pts: 100 + i, qts: i })));
+    expect([...fs.files.keys()].filter(k => k.endsWith('.tmp'))).toEqual([]);
+    const loaded = await io.load();
+    expect(loaded.kind).toBe('ok');
   });
 
   it('reports corrupt for truncated JSON', async () => {

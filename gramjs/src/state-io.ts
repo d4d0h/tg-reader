@@ -1,4 +1,5 @@
 import * as defaultFs from 'fs';
+import { randomBytes } from 'crypto';
 
 // ---------------------------------------------------------------------------
 // pts state persistence (H6 / #105)
@@ -49,7 +50,9 @@ export function createPtsStateIo(path: string, fsModule: FsLike = defaultFs) {
   }
 
   async function save(state: PtsState): Promise<void> {
-    const tmp = `${path}.tmp`;
+    // Unique tmp name per call: concurrent saves sharing one `.tmp` raced each
+    // other's rename and all but one failed with ENOENT (re-review probe).
+    const tmp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
     await fsModule.promises.writeFile(tmp, JSON.stringify(state), 'utf-8');
     await fsModule.promises.rename(tmp, path);
   }
