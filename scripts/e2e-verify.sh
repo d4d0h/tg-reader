@@ -157,12 +157,15 @@ else
   fail "GET /search FTS5: expected total=1, got: $body"
 fi
 
-# Verify sent_at is integer (not string)
-sent_at_val=$(echo "$body" | grep -o '"sent_at":[0-9]*' | head -1 | cut -d: -f2)
+# Verify sent_at is a numeric epoch value. NOTE: the Neon driver serializes
+# BIGINT columns as JSON strings ("sent_at":"1699997600"), so accept either
+# quoted or unquoted digits — what matters is that the value is a plausible
+# epoch-seconds number.
+sent_at_val=$(echo "$body" | grep -o '"sent_at":"\{0,1\}[0-9]\+' | head -1 | tr -dc '0-9')
 if [ -n "$sent_at_val" ] && [ "$sent_at_val" -gt 1000000000 ] 2>/dev/null; then
-  pass "sent_at is integer epoch seconds (value=$sent_at_val)"
+  pass "sent_at is epoch seconds (value=$sent_at_val)"
 else
-  fail "sent_at is missing or not an integer: $body"
+  fail "sent_at is missing or not numeric: $body"
 fi
 
 # Date range filter

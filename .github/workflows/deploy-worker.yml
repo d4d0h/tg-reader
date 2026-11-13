@@ -6,7 +6,11 @@ on:
     paths:
       - 'worker/**'
       - 'schema.sql'
-      - '.github/workflows/checks.yml'
+
+# Serialize production deploys instead of letting two merges race.
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
 
 jobs:
   checks:
