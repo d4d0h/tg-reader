@@ -34,7 +34,9 @@ if (isNaN(API_ID)) throw new Error('API_ID must be a valid integer');
 
 // Unix epoch seconds of the last message in the archive before the gap.
 // Messages with sent_at > GAP_START_TS are in the gap and need to be ingested.
-const GAP_START_TS = parseInt(process.env['GAP_START_TS'] ?? '1774871233', 10);
+// Operator-supplied only — a hardcoded default would silently skip the start
+// of someone else's archive (issue #106 hygiene).
+const GAP_START_TS = parseInt(requireEnv('GAP_START_TS'), 10);
 
 // ---------------------------------------------------------------------------
 // Helpers

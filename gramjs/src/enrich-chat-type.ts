@@ -122,7 +122,7 @@ async function applyUpdates(pool: Pool, accountId: string, entries: ChatTypeEntr
 }
 
 async function main(): Promise<void> {
-  const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: true } });
 
   const client = new TelegramClient(new StringSession(GRAMJS_SESSION), API_ID, API_HASH, {
     floodSleepThreshold: 300,
