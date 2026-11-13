@@ -568,9 +568,15 @@ async function persistPts(client: TelegramClient, force = false): Promise<void> 
   // Also never advance while a gap recovery is mid-flight (its own exits
   // persist deliberately via force); a 60s tick landing mid-recovery would
   // otherwise skip the unrecovered remainder.
-  if (!force && (bufferStore.pending() > 0 || gapRecoveryRunning || reconnectCheckRunning)) return;
+  const blocked = () =>
+    !force && (bufferStore.pending() > 0 || gapRecoveryRunning || reconnectCheckRunning);
+  if (blocked()) return;
   try {
     const state = await client.invoke(new Api.updates.GetState());
+    // Re-check after the await: a reconnect check (or new undelivered
+    // messages) may have started while GetState was in flight, and saving
+    // now would advance the baseline past the gap it is about to recover.
+    if (blocked()) return;
     await savePtsState({ pts: state.pts, qts: state.qts }); // L-5: persist both
   } catch {
     // ignore — state will be persisted on next tick
