@@ -19,7 +19,7 @@
     "telegram": "^2.26.22"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^26.6.6",
     "@types/pg": "^8.18.0",
     "pg": "^8.20.0",
     "ts-node": "^10.9.2",
