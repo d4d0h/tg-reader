@@ -7,12 +7,15 @@
   },
   "scripts": {
     "build": "esbuild tg.ts --bundle --platform=node --outfile=dist/tg.js --banner:js='#!/usr/bin/env node' && chmod +x dist/tg.js",
-    "dev": "ts-node tg.ts"
+    "dev": "ts-node tg.ts",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "esbuild": "^0.21.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "vitest": "^2.1.9"
   }
 }

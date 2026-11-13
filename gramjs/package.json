@@ -10,7 +10,9 @@
     "backfill-run": "npx ts-node src/backfill-run.ts",
     "gap-fill": "npx ts-node src/gap-fill.ts",
     "enrich-senders": "npx ts-node src/enrich-senders.ts",
-    "enrich-chat-type": "npx ts-node src/enrich-chat-type.ts"
+    "enrich-chat-type": "npx ts-node src/enrich-chat-type.ts",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "input": "^1.0.1",
@@ -21,6 +23,7 @@
     "@types/pg": "^8.18.0",
     "pg": "^8.20.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.9"
   }
 }
