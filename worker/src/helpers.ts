@@ -85,6 +85,16 @@ export function buildReadScopeClause(
   return { clause: `AND (${parts.join(join)})`, binds };
 }
 
+// Deduplicate a batch by a conflict key, last occurrence wins (the newest
+// version of a repeated message/contact). Without this, a duplicate key inside
+// one INSERT ... ON CONFLICT DO UPDATE batch makes Postgres abort the whole
+// statement ("ON CONFLICT DO UPDATE command cannot affect row a second time").
+export function dedupeByLast<T>(items: T[], keyFn: (item: T) => string): T[] {
+  const map = new Map<string, T>();
+  for (const item of items) map.set(keyFn(item), item);
+  return [...map.values()];
+}
+
 // ---------------------------------------------------------------------------
 // Cursor encoding for canonical paginated responses (MCP listy tools)
 // ---------------------------------------------------------------------------

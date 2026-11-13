@@ -5,7 +5,11 @@ on:
     branches: [main]
     paths:
       - 'gramjs/**'
-      - '.github/workflows/checks.yml'
+
+# Serialize production deploys instead of letting two merges race.
+concurrency:
+  group: deploy-gramjs
+  cancel-in-progress: false
 
 jobs:
   checks:

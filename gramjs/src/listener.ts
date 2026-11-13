@@ -119,6 +119,11 @@ function shouldSync(tgChatId: string, config: SyncConfig): boolean {
 let buffer: Message[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let flushing = false; // re-entrancy guard (L-2): prevents concurrent flushBuffer calls
+// Number of leading buffer entries currently inside an in-flight POST. Entries
+// in that window are already being delivered as their snapshot version; an
+// arriving edit must be APPENDED (not replace in place), or the splice after
+// delivery would discard the never-sent newer version (review finding on #101).
+let flushingBatchLen = 0;
 const seenSenderIds = new Set<string>(); // dedup upsertSenderContact within session
 
 async function flushBuffer(): Promise<void> {
@@ -126,6 +131,7 @@ async function flushBuffer(): Promise<void> {
   flushing = true;
   // Take first 100 with slice — messages stay in buffer until confirmed delivery
   const batch = buffer.slice(0, 100);
+  flushingBatchLen = batch.length;
   try {
     const res = await fetch(`${WORKER_URL}/ingest`, {
       method: 'POST',
@@ -150,6 +156,7 @@ async function flushBuffer(): Promise<void> {
     console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err), '— will retry on next flush');
   } finally {
     flushing = false;
+    flushingBatchLen = 0;
   }
 }
 
@@ -735,7 +742,18 @@ async function main(): Promise<void> {
 
   async function enqueue(msg: Message): Promise<void> {
     if (!shouldSync(msg.tg_chat_id, syncConfig)) return;
-    buffer.push(msg);
+    // H2 (#101): a message edited inside the 2s flush window would otherwise
+    // sit twice in one batch and abort the worker's whole UNNEST upsert
+    // ("cannot affect row a second time"). The newer version replaces the
+    // still-undelivered older one — EXCEPT while that older version is inside
+    // the in-flight POST (idx < flushingBatchLen): there the edit is appended
+    // after the in-flight window so it survives the post-delivery splice and
+    // the worker's upsert applies the newest text on the next flush.
+    const idx = buffer.findIndex(
+      m => m.tg_chat_id === msg.tg_chat_id && m.tg_message_id === msg.tg_message_id,
+    );
+    if (idx !== -1 && idx >= flushingBatchLen) buffer[idx] = msg;
+    else buffer.push(msg);
     if (buffer.length >= 100) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       await flushBuffer();
