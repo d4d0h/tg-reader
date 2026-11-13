@@ -8,6 +8,10 @@
 app = "tg-reader"
 primary_region = "ams"
 
+# H4 (#103): the listener's SIGTERM drain has a 25s deadline — Fly must wait
+# longer than its 5s default or the drain (and the final buffer persist) is cut.
+kill_timeout = 30
+
 [build]
 
 [env]

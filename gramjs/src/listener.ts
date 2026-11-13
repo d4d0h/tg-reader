@@ -5,9 +5,11 @@ import { StringSession } from 'telegram/sessions';
 import { NewMessage, NewMessageEvent } from 'telegram/events';
 import { EditedMessage, EditedMessageEvent } from 'telegram/events/EditedMessage';
 import { DeletedMessage, DeletedMessageEvent } from 'telegram/events/DeletedMessage';
+import { UpdateConnectionState } from 'telegram/network';
 import { Api } from 'telegram';
 import type { Message } from './types';
 import { requireEnv, resolveSenderId, resolveMediaType, resolveMessageType } from './utils';
+import { createPtsStateIo } from './state-io';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,6 +126,7 @@ let flushing = false; // re-entrancy guard (L-2): prevents concurrent flushBuffe
 // arriving edit must be APPENDED (not replace in place), or the splice after
 // delivery would discard the never-sent newer version (review finding on #101).
 let flushingBatchLen = 0;
+let consecutiveFlushFailures = 0; // H5 (#104): dead-letter a poison batch after MAX_FLUSH_FAILURES tries
 const seenSenderIds = new Set<string>(); // dedup upsertSenderContact within session
 
 async function flushBuffer(): Promise<void> {
@@ -144,19 +147,38 @@ async function flushBuffer(): Promise<void> {
     });
     if (!res.ok) {
       // L-1: messages were never removed (slice), do NOT unshift — that would duplicate them
-      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — will retry on next flush`);
+      await handleFlushFailure(batch, `worker rejected batch (HTTP ${res.status})`);
     } else {
       // Only remove from buffer after confirmed delivery
       buffer.splice(0, batch.length);
+      consecutiveFlushFailures = 0;
       const { written, noop } = (await res.json()) as { written: number; noop: number };
       console.log(`[ingest] written=${written} noop=${noop} batch=${batch.length}`);
     }
   } catch (err) {
     // L-1: same — messages still in buffer, do NOT unshift
-    console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err), '— will retry on next flush');
+    await handleFlushFailure(batch, `fetch error: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     flushing = false;
     flushingBatchLen = 0;
+    // H4 (#103): keep the on-disk copy in sync at every flush attempt
+    await persistBuffer();
+  }
+}
+
+async function handleFlushFailure(batch: Message[], reason: string): Promise<void> {
+  consecutiveFlushFailures++;
+  if (consecutiveFlushFailures >= MAX_FLUSH_FAILURES) {
+    const persisted = await deadLetterBatch(
+      batch,
+      `${reason} — giving up after ${consecutiveFlushFailures} attempts`,
+    );
+    if (persisted) {
+      buffer.splice(0, batch.length);
+      consecutiveFlushFailures = 0;
+    }
+  } else {
+    console.error(`[ingest] ${reason} — will retry on next flush (${consecutiveFlushFailures}/${MAX_FLUSH_FAILURES})`);
   }
 }
 
@@ -306,26 +328,77 @@ async function upsertSenderContact(msg: Message): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const STATE_FILE = '/data/state.json';
+const BUFFER_FILE = '/data/buffer.json';
+// H5 (#104): the in-memory buffer is capped; overflow dead-letters the oldest
+// entries to disk instead of growing until the 256MB Fly machine is OOM-killed.
+const MAX_BUFFER = 5000;
+// H5 (#104): a batch the worker keeps rejecting is dead-lettered after this
+// many consecutive failed flush attempts so it cannot block newer messages.
+const MAX_FLUSH_FAILURES = 5;
 
 interface PtsState {
   pts: number;
   qts: number; // L-5: track qts alongside pts for GetDifference
 }
 
+const stateIo = createPtsStateIo(STATE_FILE);
+
 async function loadPtsState(): Promise<PtsState | null> {
-  try {
-    const data = JSON.parse(await fs.promises.readFile(STATE_FILE, 'utf-8')) as Partial<PtsState>;
-    return data.pts ? { pts: data.pts, qts: data.qts ?? 0 } : null;
-  } catch {
-    return null;
+  const result = await stateIo.load();
+  if (result.kind === 'ok') return result.state;
+  if (result.kind === 'corrupt') {
+    // H6 (#105): a corrupt state file must NOT silently reset the baseline —
+    // gap recovery would skip and pts would be overwritten past the hole,
+    // permanently discarding everything missed. Fail loudly instead; Fly
+    // restarts (with backoff) and the operator restores or deliberately
+    // deletes /data/state.json.
+    throw new Error(
+      `${STATE_FILE} exists but is corrupt — refusing to overwrite the gap baseline. ` +
+        'Restore it from the volume or delete it deliberately to accept the data loss, then restart.',
+    );
   }
+  return null; // missing = first boot, no baseline yet
 }
 
 async function savePtsState(state: PtsState): Promise<void> {
   try {
-    await fs.promises.writeFile(STATE_FILE, JSON.stringify(state), 'utf-8');
+    await stateIo.save(state);
   } catch (err) {
     console.error('[pts] failed to save state:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// H4 (#103): persist the undelivered buffer to disk so any non-graceful exit
+// (kill, OOM, crash) can restore it on the next boot instead of losing it.
+async function persistBuffer(): Promise<void> {
+  try {
+    await fs.promises.writeFile(BUFFER_FILE, JSON.stringify(buffer), 'utf-8');
+  } catch (err) {
+    console.error('[buffer] failed to persist:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// H5 (#104): dead-letter records messages to disk with the reason, so a
+// poison batch is never silently dropped. Returns false when the file could
+// not be written — callers must then KEEP the messages in memory.
+async function deadLetterBatch(batch: Message[], reason: string): Promise<boolean> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = `/data/deadletter-${stamp}.ndjson`;
+  try {
+    const lines = batch.map(m => JSON.stringify({ reason, ...m })).join('\n') + '\n';
+    await fs.promises.writeFile(file, lines, 'utf-8');
+    console.error(
+      `[ingest] DEAD-LETTERED ${batch.length} message(s) to ${file} (${reason}) — ` +
+        'replay with the backfill tool if needed',
+    );
+    return true;
+  } catch (err) {
+    console.error(
+      `[ingest] could not write dead-letter file ${file}:`,
+      err instanceof Error ? err.message : String(err),
+      '— keeping messages in memory',
+    );
+    return false;
   }
 }
 
@@ -420,6 +493,30 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
         if (buffer.length >= 100) await flushBuffer();
       }
 
+      // M16 (#106): edits and deletes that happened while we were down arrive
+      // in otherUpdates, not newMessages — without this they are lost forever
+      // once pts advances past the gap.
+      for (const u of result.otherUpdates ?? []) {
+        if (
+          (u instanceof Api.UpdateEditMessage || u instanceof Api.UpdateEditChannelMessage) &&
+          u.message instanceof Api.Message
+        ) {
+          const edited = buildGapMessage(u.message, result.chats, result.users);
+          if (!shouldSync(edited.tg_chat_id, syncConfig)) continue;
+          buffer.push(edited);
+          if (buffer.length >= 100) await flushBuffer();
+        } else if (u instanceof Api.UpdateDeleteChannelMessages) {
+          try {
+            const { tg_chat_id } = resolvePeer(new Api.PeerChannel({ channelId: u.channelId }));
+            await notifyDeleted(tg_chat_id, u.messages);
+          } catch {
+            // unresolvable peer — skip this deletion
+          }
+        }
+        // UpdateDeleteMessages (non-channel) carries no chat context — skipped,
+        // same limitation as live private-chat deletes.
+      }
+
       if (result instanceof Api.updates.Difference) {
         // Final page — done
         await flushBuffer();
@@ -452,11 +549,62 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 }
 
 async function persistPts(client: TelegramClient): Promise<void> {
+  // H4 (#103): never persist pts past undelivered messages — gap recovery on
+  // the next boot must replay from before anything still sitting in the
+  // buffer. When the buffer drains, the next tick persists the fresh baseline.
+  if (buffer.length > 0) return;
   try {
     const state = await client.invoke(new Api.updates.GetState());
     await savePtsState({ pts: state.pts, qts: state.qts }); // L-5: persist both
   } catch {
     // ignore — state will be persisted on next tick
+  }
+}
+
+// H3 (#102): GramJS never replays updates missed while disconnected
+// (catchUp() is an empty TODO in telegram 2.x), and persistPts would advance
+// the baseline past them within 60s. On every connection-ready transition,
+// compare the server pts against the saved baseline and recover the drift.
+// The 60s persistPts interval still runs between reconnects — for a gap to
+// become permanent there, the connection must drop and heal WITHOUT a
+// ConnectionStateReady transition, which GramJS emits on every reconnect.
+let gapRecoveryRunning = false;
+async function checkPtsAndRecover(client: TelegramClient): Promise<void> {
+  if (gapRecoveryRunning) return;
+  gapRecoveryRunning = true;
+  try {
+    const saved = await stateIo.load();
+    if (saved.kind !== 'ok') return;
+    const state = await client.invoke(new Api.updates.GetState());
+    if (state.pts > saved.state.pts) {
+      console.log(
+        `[gap-recovery] pts drift after reconnect (saved=${saved.state.pts} server=${state.pts}) — recovering`,
+      );
+      await runGapRecovery(client);
+    }
+  } catch (err) {
+    console.error('[gap-recovery] reconnect check failed:', err instanceof Error ? err.message : String(err));
+  } finally {
+    gapRecoveryRunning = false;
+  }
+}
+
+// Notify the worker about observed deletions. Channel/supergroup deletes
+// carry the chat; private-chat deletes have no peer context and are skipped
+// (same limitation as the live handler).
+async function notifyDeleted(tgChatId: string, ids: number[]): Promise<void> {
+  const messages = ids.map(id => ({ tg_chat_id: tgChatId, tg_message_id: String(id) })); // S-1
+  try {
+    const res = await fetch(`${WORKER_URL}/deleted`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+      body: JSON.stringify({ messages }),
+    });
+    if (!res.ok) {
+      console.error(`[listener] DELETE notify failed: HTTP ${res.status} for ${messages.length} message(s)`);
+    }
+  } catch (err) {
+    console.error('[listener] DELETE notify failed:', err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -533,6 +681,7 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isFloodWait(errMsg)) {
         console.error('[outbox] FLOOD_WAIT >300s — stopping. Item will retry after stuck-sends recovery.');
+        await persistBuffer(); // H4 (#103): undelivered messages survive the restart
         process.exit(1);
       }
       console.error(`[outbox] failed id=${item.id}:`, errMsg);
@@ -558,6 +707,7 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isFloodWait(errMsg)) {
         console.error('[outbox] FLOOD_WAIT >300s during mass send — stopping. Item will retry after stuck-sends recovery.');
+        await persistBuffer(); // H4 (#103): undelivered messages survive the restart
         process.exit(1);
       }
       console.error(`[outbox] mass id=${item.id} failed for ${r.tg_chat_id}:`, errMsg);
@@ -650,6 +800,7 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
     const errMsg = err instanceof Error ? err.message : String(err);
     if (isFloodWait(errMsg)) {
       console.error('[actions] FLOOD_WAIT >300s — stopping. Action will be retried on restart.');
+      await persistBuffer(); // H4 (#103): undelivered messages survive the restart
       process.exit(1);
     }
     console.error(`[actions] ${action.action} failed id=${action.id}:`, errMsg);
@@ -684,7 +835,11 @@ async function main(): Promise<void> {
   const client = new TelegramClient(session, API_ID, API_HASH, {
     floodSleepThreshold: 300,
     autoReconnect: true,
-    connectionRetries: 5,   // exhaust retries → exit → Fly restarts → gap recovery picks up
+    connectionRetries: 5, // per connect cycle
+    // M15 (#106): the default is effectively unbounded reconnects; a finite
+    // cap lets a permanently dead connection end deliberately so the
+    // watchdog/Fly restart takes over instead of parking for ~25 minutes.
+    reconnectRetries: 10,
     deviceModel: 'MacBook Pro',
     systemVersion: 'macOS 26.3',
     appVersion: '12.4.2',
@@ -733,6 +888,23 @@ async function main(): Promise<void> {
     // Continue with default 'all' — better to over-capture than drop messages
   }
 
+  // 3b. H4 (#103): restore undelivered messages persisted by the previous run
+  // BEFORE gap recovery, so the pts baseline is only established after they
+  // are attempted. (Gap refetch + restored buffer may overlap; the worker's
+  // upsert makes that harmless.)
+  try {
+    const raw = await fs.promises.readFile(BUFFER_FILE, 'utf-8');
+    const restored = JSON.parse(raw) as Message[];
+    if (Array.isArray(restored) && restored.length > 0) {
+      buffer.push(...restored);
+      console.log(`[buffer] restored ${restored.length} undelivered message(s) from disk`);
+      await flushBuffer();
+    }
+    await fs.promises.unlink(BUFFER_FILE).catch(() => {});
+  } catch {
+    // no buffer file — normal after a clean shutdown
+  }
+
   // 4. Gap recovery — then immediately persist pts baseline
   await runGapRecovery(client);
   await persistPts(client); // establish baseline before first 60s interval
@@ -754,6 +926,15 @@ async function main(): Promise<void> {
     );
     if (idx !== -1 && idx >= flushingBatchLen) buffer[idx] = msg;
     else buffer.push(msg);
+    // H5 (#104): cap the buffer — if the worker is down long enough to fill
+    // it, dead-letter the oldest batch to disk instead of growing until OOM.
+    if (buffer.length > MAX_BUFFER) {
+      const overflow = buffer.slice(0, 100);
+      const persisted = await deadLetterBatch(overflow, `buffer cap ${MAX_BUFFER} exceeded — worker unreachable`);
+      if (persisted) buffer.splice(0, 100);
+    }
+    // H4 (#103): keep the on-disk copy current for any non-graceful exit
+    void persistBuffer();
     if (buffer.length >= 100) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       await flushBuffer();
@@ -781,6 +962,20 @@ async function main(): Promise<void> {
 
   console.log('[listener] NewMessage + EditedMessage handlers registered');
 
+  // H3 (#102): GramJS auto-reconnects silently but never replays the updates
+  // missed while disconnected — check pts drift on every (re)connection-ready.
+  // Connection-state changes are dispatched as UpdateConnectionState (from
+  // telegram/network, not a TL Api class), so this uses a catch-all handler.
+  client.addEventHandler((event) => {
+    const update = (event as unknown as { update?: unknown }).update;
+    if (
+      update instanceof UpdateConnectionState &&
+      update.state === UpdateConnectionState.connected
+    ) {
+      void checkPtsAndRecover(client);
+    }
+  });
+
   // DeletedMessage: mark as deleted in D1 — peer available for channels/supergroups only
   client.addEventHandler(async (event: DeletedMessageEvent) => {
     const peer = (event as unknown as { peer?: Api.TypePeer }).peer;
@@ -792,17 +987,7 @@ async function main(): Promise<void> {
     } catch {
       return;
     }
-
-    const messages = event.deletedIds.map((id: number) => ({ tg_chat_id, tg_message_id: String(id) })); // S-1
-    try {
-      await fetch(`${WORKER_URL}/deleted`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
-        body: JSON.stringify({ messages }),
-      });
-    } catch (err) {
-      console.error('[listener] DELETE notify failed:', err instanceof Error ? err.message : String(err));
-    }
+    await notifyDeleted(tg_chat_id, event.deletedIds);
   }, new DeletedMessage({}));
 
   // Persist pts every minute so gap recovery stays fresh
@@ -859,6 +1044,7 @@ async function main(): Promise<void> {
     const staleMin = Math.round((Date.now() - watchdogLastOkAt) / 60_000);
     if (staleMin > 20) {
       console.error(`[watchdog] Telegram silent ${staleMin}min — exiting for Fly restart`);
+      await persistBuffer(); // H4 (#103): keep undelivered messages for the next boot
       process.exit(1);
     }
   }, 5 * 60 * 1000);
@@ -873,11 +1059,14 @@ async function main(): Promise<void> {
     clearInterval(outboxInterval);
     clearInterval(actionsInterval);
     clearInterval(watchdogInterval);
-    // Drain entire buffer (flushBuffer only takes 100 at a time), with a 4s deadline
+    // Drain entire buffer (flushBuffer only takes 100 at a time), with a 25s
+    // deadline — fly.toml sets kill_timeout=30 so Fly actually waits for this
+    // (its default 5s used to cut the old 4s drain painfully close).
     const drainAndExit = async () => {
-      const deadline = new Promise<void>(resolve => setTimeout(resolve, 4000));
+      const deadline = new Promise<void>(resolve => setTimeout(resolve, 25_000));
       const drain = async () => { while (buffer.length > 0) await flushBuffer(); };
       await Promise.race([drain(), deadline]);
+      await persistBuffer(); // H4 (#103): anything undelivered survives the restart
       await client.disconnect().catch(() => {});
       process.exit(0);
     };
@@ -890,6 +1079,14 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   console.error('[listener] fatal error:', err instanceof Error ? err.message : String(err));
+  // H4 (#103): best-effort — persist undelivered messages before exiting.
+  // persistBuffer is module-level; call it without awaiting the event loop's
+  // microtask ordering by writing synchronously via the fs module directly.
+  try {
+    fs.writeFileSync('/data/buffer.json', JSON.stringify(buffer));
+  } catch {
+    // nothing more we can do from a fatal path
+  }
   process.exit(1);
 });
 
