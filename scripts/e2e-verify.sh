@@ -89,42 +89,40 @@ body=$(curl -s -X POST \
   -H "X-Ingest-Token: $INGEST_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"messages\":[{
-    \"tg_message_id\": $TEST_MSG_ID,
+    \"tg_message_id\": \"$TEST_MSG_ID\",
     \"tg_chat_id\": \"$TEST_CHAT_ID\",
     \"chat_name\": \"E2E Test Chat\",
     \"chat_type\": \"user\",
-    \"direction\": \"out\",
     \"message_type\": \"text\",
     \"text\": \"$KEYWORD hello world\",
     \"sent_at\": $NOW
   }]}" \
   "$WORKER_URL/ingest")
 
-inserted=$(echo "$body" | grep -o '"inserted":[0-9]*' | cut -d: -f2)
-if [ "$inserted" = "1" ]; then
-  pass "POST /ingest inserted=1 for new message"
+written=$(echo "$body" | grep -o '"written":[0-9]*' | cut -d: -f2)
+if [ "$written" = "1" ]; then
+  pass "POST /ingest written=1 for new message"
 else
   fail "POST /ingest unexpected response: $body"
 fi
 
-# Idempotency: re-insert same message — ON CONFLICT DO UPDATE always writes, so inserted=1 again
+# Idempotency: re-insert same message — ON CONFLICT DO UPDATE always writes, so written=1 again
 # What matters is no error and the row count stays at 1 in the DB
 body2=$(curl -s -X POST \
   -H "X-Ingest-Token: $INGEST_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"messages\":[{
-    \"tg_message_id\": $TEST_MSG_ID,
+    \"tg_message_id\": \"$TEST_MSG_ID\",
     \"tg_chat_id\": \"$TEST_CHAT_ID\",
     \"chat_name\": \"E2E Test Chat\",
     \"chat_type\": \"user\",
-    \"direction\": \"out\",
     \"message_type\": \"text\",
     \"text\": \"$KEYWORD hello world\",
     \"sent_at\": $NOW
   }]}" \
   "$WORKER_URL/ingest")
 
-if echo "$body2" | grep -q '"inserted"'; then
+if echo "$body2" | grep -q '"written"'; then
   pass "POST /ingest duplicate re-insert is idempotent (no error)"
 else
   fail "POST /ingest re-insert unexpected response: $body2"
@@ -288,7 +286,7 @@ header "Contacts"
 status=$(curl -s -o /dev/null -w "%{http_code}" \
   -X POST -H "X-Ingest-Token: $INGEST_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"contacts":[{"tg_user_id":"11111111","username":"e2etest","first_name":"E2E","is_bot":0}]}' \
+  -d '{"contacts":[{"tg_user_id":"11111111","username":"e2etest","first_name":"E2E","is_mutual":0,"is_bot":0}]}' \
   "$WORKER_URL/contacts")
 if [ "$status" = "200" ]; then
   pass "POST /contacts upserts contact"
