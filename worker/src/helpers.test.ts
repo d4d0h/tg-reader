@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildReadScopeClause,
   decodeCursor,
+  dedupeByLast,
   encodeCursor,
   hashToken,
   json,
@@ -9,6 +10,25 @@ import {
   toISO,
 } from './helpers';
 import type { RoleRow } from './types';
+
+describe('dedupeByLast()', () => {
+  it('keeps the last occurrence of a repeated key (first position, newest value)', () => {
+    const out = dedupeByLast(
+      [{ id: 'a', v: 1 }, { id: 'b', v: 2 }, { id: 'a', v: 3 }],
+      item => item.id,
+    );
+    expect(out).toEqual([{ id: 'a', v: 3 }, { id: 'b', v: 2 }]);
+  });
+
+  it('returns the input order when there are no duplicates', () => {
+    const out = dedupeByLast([1, 2, 3], n => String(n));
+    expect(out).toEqual([1, 2, 3]);
+  });
+
+  it('returns an empty array unchanged', () => {
+    expect(dedupeByLast([], () => '')).toEqual([]);
+  });
+});
 
 describe('json()', () => {
   it('sets JSON content type and CORS headers', () => {
