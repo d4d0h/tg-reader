@@ -25,8 +25,14 @@ export function createPtsStateIo(path: string, fsModule: FsLike = defaultFs) {
     let raw: string;
     try {
       raw = await fsModule.promises.readFile(path, 'utf-8');
-    } catch {
-      return { kind: 'missing' };
+    } catch (err) {
+      // Only a genuinely absent file is a first boot. Anything else (EACCES,
+      // EISDIR, a wedged mount) means the baseline EXISTS but cannot be read —
+      // classifying that as 'missing' would silently reset the gap baseline,
+      // the exact failure #105 refuses to allow.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT') return { kind: 'missing' };
+      return { kind: 'corrupt' };
     }
     try {
       const data = JSON.parse(raw) as Partial<PtsState>;

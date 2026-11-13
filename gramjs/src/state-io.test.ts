@@ -8,20 +8,43 @@ function fakeFs(initial: Record<string, string> = {}): FsLike & { files: Map<str
   const fsLike = {
     promises: {
       async readFile(path: string): Promise<string> {
-        if (!files.has(path)) throw new Error('ENOENT');
+        if (!files.has(path)) {
+          const e = new Error('ENOENT: no such file') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         return files.get(path)!;
       },
       async writeFile(path: string, data: string): Promise<void> {
         files.set(path, data);
       },
       async rename(from: string, to: string): Promise<void> {
-        if (!files.has(from)) throw new Error('ENOENT');
+        if (!files.has(from)) {
+          const e = new Error('ENOENT: no such file') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         files.set(to, files.get(from)!);
         files.delete(from);
       },
     },
   } as unknown as FsLike;
   return Object.assign(fsLike, { files });
+}
+
+function fsWithReadError(code: string): FsLike {
+  const fsLike = {
+    promises: {
+      async readFile(): Promise<string> {
+        const e = new Error(code) as NodeJS.ErrnoException;
+        e.code = code;
+        throw e;
+      },
+      async writeFile(): Promise<void> { /* unused in this test */ },
+      async rename(): Promise<void> { /* unused in this test */ },
+    },
+  } as unknown as FsLike;
+  return fsLike;
 }
 
 describe('createPtsStateIo', () => {
@@ -61,6 +84,13 @@ describe('createPtsStateIo', () => {
     for (const bad of ['{}', '{"pts": "123"}', '{"pts": 0}', '["pts"]', 'null']) {
       const fs2 = fakeFs({ '/data/state.json': bad });
       const io = createPtsStateIo('/data/state.json', fs2);
+      expect(await io.load()).toEqual({ kind: 'corrupt' });
+    }
+  });
+
+  it('only ENOENT is a first boot — EACCES/EISDIR are corrupt, not missing (wave-2 audit)', async () => {
+    for (const code of ['EACCES', 'EISDIR', 'EROFS']) {
+      const io = createPtsStateIo('/data/state.json', fsWithReadError(code));
       expect(await io.load()).toEqual({ kind: 'corrupt' });
     }
   });

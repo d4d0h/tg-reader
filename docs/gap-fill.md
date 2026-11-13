@@ -54,4 +54,4 @@ Verify recovery with the `stats` MCP tool — `latest_message_at` should now be 
 
 - Do **not** run gap-fill while the listener is active — stop it first.
 - The script exits automatically if a FLOOD_WAIT error exceeds 300 s; re-run the next day to resume.
-- `GAP_START_TS` defaults to a hardcoded value in the source if not set — always supply it explicitly.
+- `GAP_START_TS` is required — the script refuses to start without it (no silent default).
