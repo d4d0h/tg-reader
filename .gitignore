@@ -10,3 +10,4 @@ worker/public/
 .setup-state.json
 .setup-session.tmp
 .setup-auth-helper.cjs
+gramjs-session.txt

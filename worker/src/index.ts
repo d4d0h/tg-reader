@@ -2586,7 +2586,6 @@ async function dispatchMcpTool(
     if (name === 'generate_insight') {
       if (typeof args.tg_chat_id !== 'string') throw new Error('tg_chat_id is required');
       const chatId = args.tg_chat_id;
-      const model = typeof args.model === 'string' ? args.model : 'unknown';
       const messageLimit = typeof args.message_limit === 'number' ? args.message_limit : 500;
       const localNow = Math.floor(Date.now() / 1000);
 

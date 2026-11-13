@@ -86,7 +86,7 @@ interface ParsedArgs {
   flags: Record<string, string | true>;
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const [, , command = '', ...rest] = argv;
   const positional: string[] = [];
   const flags: Record<string, string | true> = {};
@@ -110,12 +110,12 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { command, positional, flags };
 }
 
-function flag(flags: Record<string, string | true>, name: string): string | undefined {
+export function flag(flags: Record<string, string | true>, name: string): string | undefined {
   const v = flags[name];
   return typeof v === 'string' ? v : undefined;
 }
 
-function flagInt(flags: Record<string, string | true>, name: string, fallback: number): number {
+export function flagInt(flags: Record<string, string | true>, name: string, fallback: number): number {
   const v = flag(flags, name);
   if (v === undefined) return fallback;
   const n = parseInt(v, 10);
@@ -546,7 +546,11 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  process.stderr.write(c('red', 'Fatal: ') + (err instanceof Error ? err.message : String(err)) + '\n');
-  process.exit(1);
-});
+// Only run as the entry point (node/tg.ts via ts-node, or the esbuild bundle),
+// so tests can import the module without executing the CLI.
+if (require.main === module) {
+  main().catch((err) => {
+    process.stderr.write(c('red', 'Fatal: ') + (err instanceof Error ? err.message : String(err)) + '\n');
+    process.exit(1);
+  });
+}

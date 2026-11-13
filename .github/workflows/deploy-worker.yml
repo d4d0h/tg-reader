@@ -6,16 +6,25 @@ on:
     paths:
       - 'worker/**'
       - 'schema.sql'
+      - '.github/workflows/checks.yml'
 
 jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/checks.yml
+
   deploy:
+    name: Deploy to Cloudflare Workers
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.4'
-      - run: npm install
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
         working-directory: worker
       - run: npx wrangler deploy
         working-directory: worker

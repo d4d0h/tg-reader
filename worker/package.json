@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "wrangler dev --remote",
     "deploy": "wrangler deploy",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:db": "vitest run --config vitest.db.config.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
@@ -16,6 +18,7 @@
     "@cloudflare/workers-types": "^4.20250430.0",
     "@types/pg": "^8.18.0",
     "typescript": "^5.4.0",
+    "vitest": "^2.1.9",
     "wrangler": "^3.57.0"
   }
 }
