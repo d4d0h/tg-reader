@@ -11,7 +11,7 @@
     "test:db": "vitest run --config vitest.db.config.ts"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.10.4",
+    "@neondatabase/serverless": "^1.2.0",
     "pg": "^8.20.0"
   },
   "devDependencies": {
