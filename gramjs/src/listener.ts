@@ -735,7 +735,15 @@ async function main(): Promise<void> {
 
   async function enqueue(msg: Message): Promise<void> {
     if (!shouldSync(msg.tg_chat_id, syncConfig)) return;
-    buffer.push(msg);
+    // H2 (#101): a message edited inside the 2s flush window would otherwise
+    // sit twice in one batch and abort the worker's whole UNNEST upsert
+    // ("cannot affect row a second time"). The newer version replaces the
+    // still-undelivered older one.
+    const idx = buffer.findIndex(
+      m => m.tg_chat_id === msg.tg_chat_id && m.tg_message_id === msg.tg_message_id,
+    );
+    if (idx !== -1) buffer[idx] = msg;
+    else buffer.push(msg);
     if (buffer.length >= 100) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       await flushBuffer();
