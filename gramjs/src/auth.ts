@@ -1,7 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import * as readline from 'readline';
-import { chmodSync, writeFileSync } from 'fs';
+import { chmodSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
 function prompt(question: string): Promise<string> {
@@ -49,11 +49,22 @@ async function main(): Promise<void> {
 
   // The session string is a full login to the Telegram account. Write it to a
   // 0600 file instead of echoing it to the terminal (scrollback, recordings,
-  // CI logs). Never print it to stdout.
+  // CI logs). Never print it to stdout. The 'wx' flag refuses to follow a
+  // pre-existing symlink at that path; a leftover regular file is removed
+  // first (it would only be a previous session we ourselves wrote).
   const sessionPath = resolve(process.env['SESSION_OUT'] ?? 'gramjs-session.txt');
-  writeFileSync(sessionPath, String(client.session.save()) + '\n', { mode: 0o600 });
+  const isDefaultPath = !process.env['SESSION_OUT'];
+  try {
+    writeFileSync(sessionPath, String(client.session.save()) + '\n', { mode: 0o600, flag: 'wx' });
+  } catch {
+    try { unlinkSync(sessionPath); } catch { /* nothing there */ }
+    writeFileSync(sessionPath, String(client.session.save()) + '\n', { mode: 0o600, flag: 'wx' });
+  }
   chmodSync(sessionPath, 0o600); // mode only applies on creation — tighten existing files too
   console.log(`Session string written to ${sessionPath} (mode 0600).`);
+  if (!isDefaultPath) {
+    console.log(`NOTE: ${sessionPath} is a custom SESSION_OUT — .gitignore only covers the default name, so make sure this path is not committed.`);
+  }
   console.log('Set it as the GRAMJS_SESSION secret (fly secrets set / wrangler), then delete the file.');
 
   await client.disconnect();
