@@ -3425,6 +3425,26 @@ async function fetch(request: Request, env: Env): Promise<Response> {
   }
 
   const url = new URL(request.url);
+
+  // W3 (#110): POST /admin/migrate runs BEFORE every other check — a schema
+  // migration may be a prerequisite for the very tables auth reads. Gated by
+  // its own ADMIN_MIGRATE_TOKEN secret (unset = endpoint disabled).
+  if (request.method === 'POST' && url.pathname === '/admin/migrate') {
+    const token = request.headers.get('x-admin-token');
+    if (!env.ADMIN_MIGRATE_TOKEN || !token || token !== env.ADMIN_MIGRATE_TOKEN) {
+      return json({ ok: false, error: 'Unauthorized' }, 401);
+    }
+    try {
+      const sql = getSql(env);
+      const log = await applyMigrations((text: string, params?: unknown[]) => sql(text, (params ?? []) as never[]));
+      console.log('[admin/migrate]', log.join(' | '));
+      return json({ ok: true, log });
+    } catch (err) {
+      console.error('[admin/migrate] failed:', err);
+      return json({ ok: false, error: 'migration failed', detail: err instanceof Error ? err.message : String(err) }, 500);
+    }
+  }
+
   const isMcp = url.pathname === '/mcp';
 
   // For /mcp: the claude.ai connector dialog only supports a URL — no custom headers.
