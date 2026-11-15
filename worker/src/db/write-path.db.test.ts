@@ -138,6 +138,109 @@ describe('POST /outbox/:id/ack (#107 #108)', () => {
   });
 });
 
+describe('concurrent claims — two pollers never get the same row (audit round 1)', () => {
+  async function concurrentRounds(claim: () => Promise<number[]>, rounds: number): Promise<number> {
+    let overlaps = 0;
+    for (let i = 0; i < rounds; i++) {
+      const [a, b] = await Promise.all([claim(), claim()]);
+      overlaps += a.filter(id => b.includes(id)).length;
+    }
+    return overlaps;
+  }
+
+  it('outbox: overlapping /outbox/due claims are disjoint', async () => {
+    for (let i = 0; i < 30; i++) await insertOutbox('pending');
+    const claim = async (): Promise<number[]> => {
+      const res = await handleGetOutboxDue(get(), env, ACCOUNT);
+      return ((await res.json()) as OutboxItem[]).map(i => i.id);
+    };
+    expect(await concurrentRounds(claim, 8)).toBe(0);
+    const { rows } = await pool.query<{ n: string }>(`SELECT COUNT(*) AS n FROM outbox WHERE status = 'sending'`);
+    expect(Number(rows[0]!.n)).toBe(30); // each claimed exactly once overall
+  });
+
+  it('actions: overlapping /actions/pending claims are disjoint', async () => {
+    for (let i = 0; i < 30; i++) {
+      await pool.query(
+        `INSERT INTO pending_actions (account_id, action, tg_chat_id, tg_message_id) VALUES ($1, 'edit', '555', $2)`,
+        [ACCOUNT, String(1000 + i)],
+      );
+    }
+    const claim = async (): Promise<number[]> => {
+      const res = await handleGetActionsPending(get(), env, ACCOUNT);
+      return ((await res.json()) as Array<{ id: number }>).map(r => r.id);
+    };
+    expect(await concurrentRounds(claim, 8)).toBe(0);
+    const { rows } = await pool.query<{ n: string }>(`SELECT COUNT(*) AS n FROM pending_actions WHERE status = 'sending'`);
+    expect(Number(rows[0]!.n)).toBe(30);
+  });
+});
+
+describe('mass-send finalize + parked requeue (audit round 1)', () => {
+  it('a stuck mass send with ALL recipients terminal auto-finalizes instead of parking', async () => {
+    const { rows: o } = await pool.query<{ id: number }>(
+      `INSERT INTO outbox (account_id, text, status, updated_at) VALUES ($1, 'hi', 'sending', $2) RETURNING id`,
+      [ACCOUNT, NOW - 400],
+    );
+    const id = o[0]!.id;
+    await pool.query(
+      `INSERT INTO outbox_recipients (outbox_id, tg_chat_id, status, sent_message_id) VALUES ($1,'556','sent','900'), ($1,'557','failed',NULL)`,
+      [id],
+    );
+    const res = await handleGetOutboxDue(get(), env, ACCOUNT);
+    expect(((await res.json()) as OutboxItem[])).toHaveLength(0);
+    const { rows } = await pool.query<{ status: string }>('SELECT status FROM outbox WHERE id = $1', [id]);
+    expect(rows[0]!.status).toBe('partial'); // mixed sent/failed
+  });
+
+  it('a stuck mass send with a pending recipient still parks (undelivered work remains)', async () => {
+    const { rows: o } = await pool.query<{ id: number }>(
+      `INSERT INTO outbox (account_id, text, status, updated_at) VALUES ($1, 'hi', 'sending', $2) RETURNING id`,
+      [ACCOUNT, NOW - 400],
+    );
+    const id = o[0]!.id;
+    await pool.query(
+      `INSERT INTO outbox_recipients (outbox_id, tg_chat_id, status) VALUES ($1,'556','sent'), ($1,'557','pending')`,
+      [id],
+    );
+    await handleGetOutboxDue(get(), env, ACCOUNT);
+    const { rows } = await pool.query<{ status: string }>('SELECT status FROM outbox WHERE id = $1', [id]);
+    expect(rows[0]!.status).toBe('needs_review');
+  });
+
+  it('requeue: a parked mass send returns to pending and a fresh claim re-sends ONLY undelivered recipients', async () => {
+    const { rows: o } = await pool.query<{ id: number }>(
+      `INSERT INTO outbox (account_id, text, status, updated_at) VALUES ($1, 'hi', 'needs_review', $2) RETURNING id`,
+      [ACCOUNT, NOW - 400],
+    );
+    const id = o[0]!.id;
+    await pool.query(
+      `INSERT INTO outbox_recipients (outbox_id, tg_chat_id, status, sent_message_id)
+       VALUES ($1,'556','sent','901'), ($1,'557','pending',NULL)`,
+      [id],
+    );
+    const requeue = await handleAckOutbox(id, post('/ack', { status: 'pending' }), env, ACCOUNT);
+    expect(requeue.status).toBe(200);
+    const claim = await handleGetOutboxDue(get(), env, ACCOUNT);
+    const mine = ((await claim.json()) as OutboxItem[]).find(i => i.id === id);
+    expect(mine).toBeDefined();
+    expect(mine!.recipients).toHaveLength(1);            // only the pending one
+    expect(mine!.recipients![0]!.tg_chat_id).toBe('557');
+  });
+
+  it('requeue is refused for a single send with a recorded delivery id', async () => {
+    const id = await insertOutbox('needs_review', 0, true);
+    const res = await handleAckOutbox(id, post('/ack', { status: 'pending' }), env, ACCOUNT);
+    expect(res.status).toBe(409);
+  });
+
+  it('requeue is refused for items that are not parked', async () => {
+    const id = await insertOutbox('draft');
+    const res = await handleAckOutbox(id, post('/ack', { status: 'pending' }), env, ACCOUNT);
+    expect(res.status).toBe(409);
+  });
+});
+
 describe('GET /actions/pending + ack — claim-based handout (#109)', () => {
   interface ActionRow { id: number; action: string; status: string }
 

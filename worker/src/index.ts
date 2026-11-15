@@ -1442,7 +1442,10 @@ export async function handleGetOutboxDue(_request: Request, env: Env, accountId:
     // finalize it as 'sent' (never re-send). WITHOUT one, park it in
     // 'needs_review' instead of blindly retrying: the send may or may not have
     // gone out, and a duplicate would go to a real person from the owner's
-    // account. The operator resolves parked items via PATCH/ack.
+    // account. The operator resolves parked items via the ack endpoint:
+    // a terminal status closes the item; status 'pending' requeues it
+    // (single sends only without a recorded delivery id; mass sends requeue
+    // safely because re-claiming re-sends only recipients still 'pending').
     const rows = await sql(
       `WITH finalize_delivered AS (
          UPDATE outbox
@@ -1454,14 +1457,33 @@ export async function handleGetOutboxDue(_request: Request, env: Env, accountId:
            AND sent_message_id IS NOT NULL
          RETURNING id
        ),
+       finalize_mass AS (
+         -- W3 audit: a mass send whose recipients are ALL terminal (each with
+         -- its own delivered/failed record) is fully reconciled — finalize it
+         -- instead of parking a verifiably-delivered batch.
+         UPDATE outbox o
+         SET status = CASE
+               WHEN NOT EXISTS (SELECT 1 FROM outbox_recipients r WHERE r.outbox_id = o.id AND r.status = 'sent') THEN 'failed'
+               WHEN NOT EXISTS (SELECT 1 FROM outbox_recipients r WHERE r.outbox_id = o.id AND r.status = 'failed') THEN 'sent'
+               ELSE 'partial'
+             END,
+             updated_at = $1
+         WHERE o.account_id = $2
+           AND o.status = 'sending'
+           AND o.updated_at < $1 - 300
+           AND o.tg_chat_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM outbox_recipients r WHERE r.outbox_id = o.id AND r.status = 'pending')
+         RETURNING o.id
+       ),
        park_unconfirmed AS (
          UPDATE outbox
          SET status = 'needs_review', updated_at = $1,
-             error = COALESCE(error, 'stuck in sending >5min with no sent_message_id — parked, never auto-retried')
+             error = COALESCE(error, 'stuck in sending >5min with no confirmed delivery — parked, never auto-retried; delivery may have partially or fully happened, check recipient records before re-sending (requeue via ack status=pending re-sends only undelivered recipients)')
          WHERE account_id = $2
            AND status = 'sending'
            AND updated_at < $1 - 300
            AND id NOT IN (SELECT id FROM finalize_delivered)
+           AND id NOT IN (SELECT id FROM finalize_mass)
          RETURNING id
        ),
        claimed AS (
@@ -1476,7 +1498,14 @@ export async function handleGetOutboxDue(_request: Request, env: Env, accountId:
              )
            ORDER BY id
            LIMIT 10
+           FOR UPDATE SKIP LOCKED
          )
+         -- W3 audit: the status re-test on the OUTER update is what makes this
+         -- a claim — under READ COMMITTED a concurrent statement's inner
+         -- SELECT snapshots before our flip to 'sending', and without this
+         -- re-test EvalPlanQual re-claims the same row (probe-proven
+         -- double-claim; SKIP LOCKED alone also fixes it, both are kept).
+         AND status IN ('pending', 'scheduled')
          RETURNING id, tg_chat_id, reply_to_message_id, text, scheduled_at, sent_at, created_at, updated_at
        )
        SELECT c.*, 'sending' AS status FROM claimed c`,
@@ -1594,8 +1623,13 @@ export async function handleAckOutbox(outboxId: number, request: Request, env: E
   // W3 (#107/#108): 'sending' is a progress ack — it records per-recipient
   // results (incl. sent ids) and refreshes the claim timestamp so a long mass
   // send is never "stuck"-reset mid-flight, but never finalizes the item.
-  if (!['sent', 'failed', 'partial', 'sending'].includes(status)) {
-    return json({ ok: false, error: 'status must be sent, failed, partial, or sending' }, 400);
+  // 'pending' is the OPERATOR REQUEUE for a parked item (audit finding: the
+  // old comment claimed PATCH could resolve parks — it is draft-only). A
+  // single send with a recorded sent id cannot be requeued (it demonstrably
+  // went out); a mass send can — re-claiming re-sends only recipients still
+  // 'pending', thanks to the per-recipient delivery records.
+  if (!['sent', 'failed', 'partial', 'sending', 'pending'].includes(status)) {
+    return json({ ok: false, error: 'status must be sent, failed, partial, sending, or pending (requeue)' }, 400);
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -1607,18 +1641,20 @@ export async function handleAckOutbox(outboxId: number, request: Request, env: E
   try {
     // W3 (#108): the ack respects the claim. Terminal acks land only while the
     // item is 'sending' (the listener's claim) or 'needs_review' (an operator
-    // resolving a parked item); progress acks only while 'sending'. A late or
-    // racing ack can no longer flip an unrelated status.
+    // resolving a parked item); progress acks only while 'sending'; the
+    // requeue only from 'needs_review' and only when no delivery was recorded.
     const rows = await sql(
       `UPDATE outbox
        SET status = CASE WHEN $1 = 'sending' THEN status ELSE $1 END,
-           sent_at = CASE WHEN $1 = 'sending' THEN sent_at ELSE $2 END,
-           error = CASE WHEN $1 = 'sending' THEN error ELSE $3 END,
+           sent_at = CASE WHEN $1 = 'pending' THEN NULL WHEN $1 = 'sending' THEN sent_at ELSE $2 END,
+           error = CASE WHEN $1 = 'pending' THEN NULL WHEN $1 = 'sending' THEN error ELSE $3 END,
            sent_message_id = COALESCE($4, sent_message_id),
            updated_at = $5
        WHERE account_id = $6 AND id = $7
          AND ( ($1 = 'sending' AND status = 'sending')
-            OR ($1 != 'sending' AND status IN ('sending','needs_review')) )
+            OR ($1 IN ('sent','failed','partial') AND status IN ('sending','needs_review'))
+            OR ($1 = 'pending' AND status = 'needs_review'
+                AND (tg_chat_id IS NULL OR sent_message_id IS NULL)) )
        RETURNING id, status`,
       [status, sentAt, error, sentMessageId, now, accountId, outboxId],
     ) as Array<{ id: number; status: string }>;
@@ -1724,7 +1760,11 @@ export async function handleGetActionsPending(_request: Request, env: Env, accou
            WHERE account_id = $1 AND status = 'pending'
            ORDER BY created_at ASC
            LIMIT 10
+           FOR UPDATE SKIP LOCKED
          )
+         -- W3 audit: outer status re-test — without it a concurrent claim
+         -- re-hands out the same row (READ COMMITTED + stale inner snapshot).
+         AND status = 'pending'
          RETURNING id, action, tg_chat_id, tg_message_id, text, to_chat_id, created_at
        )
        SELECT * FROM claimed`,

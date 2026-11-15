@@ -895,10 +895,28 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
   }
 }
 
+// W3 (#109 audit): same re-entrancy guard as pollOutbox — a slow action batch
+// (FLOOD_WAIT sleeps up to 300s) must not overlap the next 30s tick.
+let actionsPollRunning = false;
+
 async function pollActions(client: TelegramClient): Promise<void> {
+  if (actionsPollRunning) {
+    console.warn('[actions] previous poll still running — skipping this tick');
+    return;
+  }
+  actionsPollRunning = true;
+  try {
+    await pollActionsInner(client);
+  } finally {
+    actionsPollRunning = false;
+  }
+}
+
+async function pollActionsInner(client: TelegramClient): Promise<void> {
   try {
     const res = await fetch(`${WORKER_URL}/actions/pending`, {
       headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) { console.error(`[actions] poll failed: HTTP ${res.status}`); return; }
     const actions = (await res.json()) as PendingAction[];

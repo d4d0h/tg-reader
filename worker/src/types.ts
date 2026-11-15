@@ -9,6 +9,7 @@ export interface OutboxRecipient {
   status: 'pending' | 'sent' | 'failed';
   sent_at?: number;
   error?: string;
+  sent_message_id?: string;       // W3 (#107): delivered Telegram message id
 }
 
 // Outbox item — one row per message (draft / scheduled / single / mass)
@@ -18,12 +19,15 @@ export interface OutboxItem {
   tg_chat_id?: string;            // null for mass sends
   reply_to_message_id?: number;
   text: string;
-  status: 'draft' | 'scheduled' | 'pending' | 'sending' | 'sent' | 'failed' | 'partial';
+  // 'needs_review' (W3): a stuck claim, parked — never auto-retried; the
+  // operator closes it via a terminal ack or requeues via ack status=pending.
+  status: 'draft' | 'scheduled' | 'pending' | 'sending' | 'sent' | 'failed' | 'partial' | 'needs_review';
   scheduled_at?: number;          // unix epoch seconds
   error?: string;
   created_at: number;
   updated_at: number;
   sent_at?: number;
+  sent_message_id?: string;       // W3 (#107): single-send delivery record
   recipients?: OutboxRecipient[]; // populated by /outbox/due
 }
 

@@ -153,11 +153,12 @@ CREATE TABLE IF NOT EXISTS outbox (
   error               TEXT,
   created_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
   updated_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-  sent_at             BIGINT    -- unix epoch seconds when actually sent (mass send: when started)
-  -- W3 (#107): sent_message_id TEXT — Telegram message id of the delivered
-  -- send. A stuck claim WITH one is finalized as sent (never re-sent);
-  -- without one it is parked in needs_review rather than retried blindly.
-  -- Existing databases get it via scripts/migrate.ts (2026-11-15-write-path).
+  sent_at             BIGINT,   -- unix epoch seconds when actually sent (mass send: when started)
+  -- W3 (#107): Telegram message id of the delivered send. A stuck claim WITH
+  -- one is finalized as sent (never re-sent); without one it is parked in
+  -- needs_review rather than retried blindly. Existing databases get the
+  -- column via scripts/migrate.ts (2026-11-15-write-path).
+  sent_message_id     TEXT
 );
 
 -- Per-recipient rows for mass sends; absent = single-chat send
