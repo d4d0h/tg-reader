@@ -10,7 +10,13 @@ vi.mock('@neondatabase/serverless', async () => {
   const pool = new pgMod.Pool({ connectionString: process.env['TEST_DATABASE_URL'] ?? '' });
   return {
     neon: () => (text: string, params?: unknown[]) =>
-      pool.query(text, (params ?? []) as never[]).then(r => ({ rows: r.rows, rowCount: r.rowCount ?? 0 })),
+      pool.query(text, (params ?? []) as never[]).then(r => {
+        // Mirror BOTH neon() call forms: plain calls get the rows array,
+        // {fullResults: true} callers read .rowCount off the same object.
+        const rows = r.rows as unknown[] & { rowCount?: number };
+        rows.rowCount = r.rowCount ?? 0;
+        return rows;
+      }),
   };
 });
 
