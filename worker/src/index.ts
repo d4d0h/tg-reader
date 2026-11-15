@@ -1648,7 +1648,10 @@ export async function handleAckOutbox(outboxId: number, request: Request, env: E
        SET status = CASE WHEN $1 = 'sending' THEN status ELSE $1 END,
            sent_at = CASE WHEN $1 = 'pending' THEN NULL WHEN $1 = 'sending' THEN sent_at ELSE $2 END,
            error = CASE WHEN $1 = 'pending' THEN NULL WHEN $1 = 'sending' THEN error ELSE $3 END,
-           sent_message_id = COALESCE($4, sent_message_id),
+           -- a requeue records no delivery id (closing-pass note: a
+           -- contradictory pending+id ack must not plant a phantom id that
+           -- would later finalize the item as delivered)
+           sent_message_id = CASE WHEN $1 = 'pending' THEN sent_message_id ELSE COALESCE($4, sent_message_id) END,
            updated_at = $5
        WHERE account_id = $6 AND id = $7
          AND ( ($1 = 'sending' AND status = 'sending')
