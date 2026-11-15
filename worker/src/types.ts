@@ -37,6 +37,7 @@ export interface Env {
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
   MASTER_TOKEN: string;  // full access + permission management; separate from INGEST_TOKEN
+  ADMIN_MIGRATE_TOKEN?: string; // gates POST /admin/migrate; unset = endpoint disabled
   AI: Ai;                // Workers AI binding — used by cloudflare-ai provider jobs
 }
 

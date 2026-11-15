@@ -3,6 +3,7 @@ import type { Env, Message, OutboxItem, OutboxRecipient, RoleRow, TokenContext }
 import { MCP_TOOL_DEFINITIONS } from './mcp-tools';
 import { json, getSql, toISO, hashToken, parseJsonColumn, buildReadScopeClause, encodeCursor, decodeCursor, dedupeByLast } from './helpers';
 import { authenticate, authenticateMcp } from './auth';
+import { applyMigrations } from './migrations';
 
 
 // Check write permission for a scoped agent. Returns a permission_denied object on failure,
@@ -3038,6 +3039,27 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 
   if (method === 'GET' && pathname === '/config') {
     return handleGetConfig(request, env, accountId);
+  }
+
+  // W3 (#110): run schema migrations with the Worker's own DATABASE_URL.
+  // Gated by a dedicated secret — unset disables the endpoint entirely.
+  // Runs BEFORE the normal auth (it must work even when a migration is a
+  // prerequisite for the auth tables), but its token is separate from every
+  // other credential.
+  if (method === 'POST' && pathname === '/admin/migrate') {
+    const token = request.headers.get('x-admin-token');
+    if (!env.ADMIN_MIGRATE_TOKEN || !token || token !== env.ADMIN_MIGRATE_TOKEN) {
+      return json({ ok: false, error: 'Unauthorized' }, 401);
+    }
+    try {
+      const sql = getSql(env);
+      const log = await applyMigrations((text: string, params?: unknown[]) => sql(text, (params ?? []) as never[]));
+      console.log('[admin/migrate]', log.join(' | '));
+      return json({ ok: true, log });
+    } catch (err) {
+      console.error('[admin/migrate] failed:', err);
+      return json({ ok: false, error: 'migration failed', detail: err instanceof Error ? err.message : String(err) }, 500);
+    }
   }
 
   if (method === 'POST' && pathname === '/config') {
