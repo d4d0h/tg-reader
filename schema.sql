@@ -146,13 +146,19 @@ CREATE TABLE IF NOT EXISTS outbox (
   -- sent       → delivered (single send)
   -- failed     → delivery failed (single send or entire mass send)
   -- partial    → mass send where at least one recipient failed
+  -- needs_review → a stuck claim: never auto-retried, the operator decides
   status              TEXT NOT NULL DEFAULT 'draft'
-                        CHECK(status IN ('draft','scheduled','pending','sending','sent','failed','partial')),
+                        CHECK(status IN ('draft','scheduled','pending','sending','sent','failed','partial','needs_review')),
   scheduled_at        BIGINT,   -- unix epoch seconds; NULL = send immediately when triggered
   error               TEXT,
   created_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
   updated_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-  sent_at             BIGINT    -- unix epoch seconds when actually sent (mass send: when started)
+  sent_at             BIGINT,   -- unix epoch seconds when actually sent (mass send: when started)
+  -- W3 (#107): Telegram message id of the delivered send. A stuck claim WITH
+  -- one is finalized as sent (never re-sent); without one it is parked in
+  -- needs_review rather than retried blindly. Existing databases get the
+  -- column via scripts/migrate.ts (2026-11-15-write-path).
+  sent_message_id     TEXT
 );
 
 -- Per-recipient rows for mass sends; absent = single-chat send
@@ -166,7 +172,8 @@ CREATE TABLE IF NOT EXISTS outbox_recipients (
   status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK(status IN ('pending','sent','failed')),
   sent_at     BIGINT,
-  error       TEXT
+  error       TEXT,
+  sent_message_id TEXT   -- W3 (#107): delivered Telegram message id (mass sends)
 );
 
 -- GramJS polls for pending/due-scheduled items
@@ -189,9 +196,12 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   text          TEXT,            -- edit only: new message text
   to_chat_id    TEXT,            -- forward only: destination chat ID
   status        TEXT NOT NULL DEFAULT 'pending'
-                  CHECK(status IN ('pending', 'done', 'failed')),
+                  -- W3 (#109): 'sending' = claimed by the listener (exactly-once
+                  -- handout), 'needs_review' = claim stuck >5 min, never auto-retried.
+                  CHECK(status IN ('pending', 'sending', 'done', 'failed', 'needs_review')),
   error         TEXT,
-  created_at    BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+  created_at    BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  claimed_at    BIGINT   -- W3 (#109): when the listener claimed it
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_actions_due ON pending_actions(account_id, status)

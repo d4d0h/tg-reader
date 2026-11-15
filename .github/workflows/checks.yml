@@ -54,7 +54,12 @@ jobs:
         with:
           node-version: '22.23.4'
           cache: npm
-          cache-dependency-path: worker/package-lock.json
+          cache-dependency-path: |
+            worker/package-lock.json
+            package-lock.json
+      # Root deps (pg, tsx) — the db test setup runs the real migration script.
+      - run: npm ci
+        working-directory: .
       - run: npm ci
       - run: npm run test:db
 

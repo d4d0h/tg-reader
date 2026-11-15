@@ -9,7 +9,7 @@ import { DeletedMessage, DeletedMessageEvent } from 'telegram/events/DeletedMess
 import { UpdateConnectionState } from 'telegram/network';
 import { Api } from 'telegram';
 import type { Message } from './types';
-import { requireEnv, resolveSenderId, resolveMediaType, resolveMessageType } from './utils';
+import { requireEnv, resolveSenderId, resolveMediaType, resolveMessageType, sleep } from './utils';
 import { createPtsStateIo } from './state-io';
 import { createBufferStore } from './buffer-store';
 
@@ -662,18 +662,47 @@ function renderTemplate(text: string, ctx: { first_name?: string; last_name?: st
     .replace(/\{username\}/g, ctx.username ?? '');
 }
 
+// W3 (#107/#108): acks carry the delivered Telegram message id — a stuck
+// claim that has one is finalized as sent by the worker, never re-sent — and
+// are retried (3 attempts) so a transient network blip on the ack can no
+// longer leave a delivered send looking unconfirmed.
 async function ackOutbox(
   id: number,
-  status: 'sent' | 'failed' | 'partial',
+  status: 'sent' | 'failed' | 'partial' | 'sending',
   sentAt: number,
   error?: string,
-  recipientResults?: Array<{ id: number; status: string; sent_at?: number; error?: string }>,
-): Promise<void> {
-  await fetch(`${WORKER_URL}/outbox/${id}/ack`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
-    body: JSON.stringify({ status, sent_at: sentAt, error: error ?? null, results: recipientResults ?? null }),
+  recipientResults?: Array<{ id: number; status: string; sent_at?: number; error?: string; sent_message_id?: string }>,
+  sentMessageId?: string,
+): Promise<boolean> {
+  const body = JSON.stringify({
+    status,
+    sent_at: sentAt,
+    error: error ?? null,
+    results: recipientResults ?? null,
+    sent_message_id: sentMessageId ?? null,
   });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${WORKER_URL}/outbox/${id}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+        body,
+      });
+      if (res.ok) return true;
+      // 409 = the claim was resolved/parked server-side — do not retry.
+      if (res.status === 409) {
+        console.error(`[outbox] ack for id=${id} rejected (claim already resolved) — giving up`);
+        return false;
+      }
+    } catch (err) {
+      if (attempt === 3) {
+        console.error('[outbox] ack fetch error:', err instanceof Error ? err.message : String(err));
+        return false;
+      }
+    }
+    await sleep(500 * attempt);
+  }
+  return false;
 }
 
 // Resolve a peer for sending. Tries username first (works without entity cache),
@@ -697,9 +726,9 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
   if (item.tg_chat_id) {
     try {
       const entity = await resolveEntity(client, item.tg_chat_id);
-      await client.sendMessage(entity, { message: item.text, ...replyTo });
-      await ackOutbox(item.id, 'sent', sentAt);
-      console.log(`[outbox] sent id=${item.id} chat=${item.tg_chat_id}`);
+      const sent = await client.sendMessage(entity, { message: item.text, ...replyTo });
+      await ackOutbox(item.id, 'sent', sentAt, undefined, undefined, String(sent.id));
+      console.log(`[outbox] sent id=${item.id} chat=${item.tg_chat_id} msg=${sent.id}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isFloodWait(errMsg)) {
@@ -713,9 +742,13 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
     return;
   }
 
-  // Mass send
+  // Mass send — W3 (#108): each delivered recipient is acked immediately as a
+  // progress update (status 'sending'), recording its sent id. The worker sees
+  // continuous progress, so a loop longer than the 5-minute stuck threshold is
+  // never re-claimed mid-flight, and an interrupted mass send never re-sends
+  // an already-delivered recipient.
   const recipients = item.recipients ?? [];
-  const results: Array<{ id: number; status: string; sent_at?: number; error?: string }> = [];
+  const finalResults: Array<{ id: number; status: string; sent_at?: number; error?: string; sent_message_id?: string }> = [];
   let failCount = 0;
 
   for (let i = 0; i < recipients.length; i++) {
@@ -723,9 +756,11 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
     const text = renderTemplate(item.text, { first_name: r.first_name, last_name: r.last_name, username: r.username });
     try {
       const entity = await resolveEntity(client, r.tg_chat_id, r.username);
-      await client.sendMessage(entity, { message: text });
-      results.push({ id: r.id, status: 'sent', sent_at: Math.floor(Date.now() / 1000) });
-      console.log(`[outbox] mass id=${item.id} sent to ${r.tg_chat_id}`);
+      const sent = await client.sendMessage(entity, { message: text });
+      const result = { id: r.id, status: 'sent', sent_at: Math.floor(Date.now() / 1000), sent_message_id: String(sent.id) };
+      finalResults.push(result);
+      await ackOutbox(item.id, 'sending', sentAt, undefined, [result]);
+      console.log(`[outbox] mass id=${item.id} sent to ${r.tg_chat_id} msg=${sent.id}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isFloodWait(errMsg)) {
@@ -734,7 +769,9 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
         process.exit(1);
       }
       console.error(`[outbox] mass id=${item.id} failed for ${r.tg_chat_id}:`, errMsg);
-      results.push({ id: r.id, status: 'failed', error: errMsg });
+      const result = { id: r.id, status: 'failed', error: errMsg };
+      finalResults.push(result);
+      await ackOutbox(item.id, 'sending', sentAt, undefined, [result]);
       failCount++;
     }
     // 2–5s jitter between recipients to avoid flood
@@ -744,10 +781,27 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
   }
 
   const finalStatus = failCount === 0 ? 'sent' : failCount === recipients.length ? 'failed' : 'partial';
-  await ackOutbox(item.id, finalStatus, sentAt, undefined, results);
+  await ackOutbox(item.id, finalStatus, sentAt, undefined, finalResults);
 }
 
+// W3 (#108): the 30s interval must never overlap itself — a slow mass send
+// in one tick must not trigger a second claim loop on the next.
+let outboxPollRunning = false;
+
 async function pollOutbox(client: TelegramClient): Promise<void> {
+  if (outboxPollRunning) {
+    console.warn('[outbox] previous poll still running — skipping this tick');
+    return;
+  }
+  outboxPollRunning = true;
+  try {
+    await pollOutboxInner(client);
+  } finally {
+    outboxPollRunning = false;
+  }
+}
+
+async function pollOutboxInner(client: TelegramClient): Promise<void> {
   try {
     const res = await fetch(`${WORKER_URL}/outbox/due`, {
       headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
@@ -778,11 +832,21 @@ interface PendingAction {
 }
 
 async function ackAction(id: number, status: 'done' | 'failed', error?: string): Promise<void> {
-  await fetch(`${WORKER_URL}/actions/${id}/ack`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
-    body: JSON.stringify({ status, error: error ?? null }),
-  });
+  // W3 (#109): with claim-based handout, a silently failed ack would leave the
+  // row stuck in 'sending' until it parks — retry so the usual path settles it.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${WORKER_URL}/actions/${id}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+        body: JSON.stringify({ status, error: error ?? null }),
+      });
+      if (res.ok || res.status === 409) return; // 409 = already resolved/parked
+    } catch (err) {
+      if (attempt === 3) console.error('[actions] ack fetch error:', err instanceof Error ? err.message : String(err));
+    }
+    await sleep(500 * attempt);
+  }
 }
 
 async function processAction(client: TelegramClient, action: PendingAction): Promise<void> {
@@ -831,10 +895,28 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
   }
 }
 
+// W3 (#109 audit): same re-entrancy guard as pollOutbox — a slow action batch
+// (FLOOD_WAIT sleeps up to 300s) must not overlap the next 30s tick.
+let actionsPollRunning = false;
+
 async function pollActions(client: TelegramClient): Promise<void> {
+  if (actionsPollRunning) {
+    console.warn('[actions] previous poll still running — skipping this tick');
+    return;
+  }
+  actionsPollRunning = true;
+  try {
+    await pollActionsInner(client);
+  } finally {
+    actionsPollRunning = false;
+  }
+}
+
+async function pollActionsInner(client: TelegramClient): Promise<void> {
   try {
     const res = await fetch(`${WORKER_URL}/actions/pending`, {
       headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) { console.error(`[actions] poll failed: HTTP ${res.status}`); return; }
     const actions = (await res.json()) as PendingAction[];

@@ -8,5 +8,8 @@ export default defineConfig({
     include: ['src/**/*.db.test.ts'],
     environment: 'node',
     globalSetup: ['./vitest.db.global-setup.ts'],
+    // All db test files share one database — running them in parallel makes
+    // one file's TRUNCATE wipe another's fixtures.
+    fileParallelism: false,
   },
 });
