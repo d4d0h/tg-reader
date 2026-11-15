@@ -1342,7 +1342,7 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 // Outbox — drafts, scheduled sends, replies, mass sends
 // ---------------------------------------------------------------------------
 
-const VALID_OUTBOX_STATUSES = ['draft', 'scheduled', 'pending', 'sending', 'sent', 'failed', 'partial'] as const;
+const VALID_OUTBOX_STATUSES = ['draft', 'scheduled', 'pending', 'sending', 'sent', 'failed', 'partial', 'needs_review'] as const;
 
 async function handlePostOutbox(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
@@ -1433,27 +1433,36 @@ async function handleGetOutbox(request: Request, env: Env, accountId: string): P
 
 // GET /outbox/due — atomically claims pending/due-scheduled items for GramJS to process.
 // Uses a single CTE statement (atomic in PostgreSQL) to reset stuck + claim due items.
-async function handleGetOutboxDue(_request: Request, env: Env, accountId: string): Promise<Response> {
+export async function handleGetOutboxDue(_request: Request, env: Env, accountId: string): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
   const sql = getSql(env);
   try {
-    // Single atomic CTE: reset stuck 'sending' items (>5 min) then claim due items.
-    // Also reset recipients of stuck mass sends so they can be retried.
+    // Single atomic CTE: resolve stuck 'sending' items (>5 min), then claim due items.
+    // W3 (#107): a stuck item WITH a recorded sent_message_id was delivered —
+    // finalize it as 'sent' (never re-send). WITHOUT one, park it in
+    // 'needs_review' instead of blindly retrying: the send may or may not have
+    // gone out, and a duplicate would go to a real person from the owner's
+    // account. The operator resolves parked items via PATCH/ack.
     const rows = await sql(
-      `WITH reset_stuck AS (
+      `WITH finalize_delivered AS (
          UPDATE outbox
-         SET status = 'pending', updated_at = $1
+         SET status = 'sent', updated_at = $1
          WHERE account_id = $2
            AND status = 'sending'
            AND updated_at < $1 - 300
+           AND tg_chat_id IS NOT NULL
+           AND sent_message_id IS NOT NULL
          RETURNING id
        ),
-       reset_stuck_recipients AS (
-         -- Reset failed recipients so they are retried; leave 'sent' ones alone (no double-send)
-         UPDATE outbox_recipients
-         SET status = 'pending'
-         WHERE outbox_id IN (SELECT id FROM reset_stuck)
-           AND status = 'failed'
+       park_unconfirmed AS (
+         UPDATE outbox
+         SET status = 'needs_review', updated_at = $1,
+             error = COALESCE(error, 'stuck in sending >5min with no sent_message_id — parked, never auto-retried')
+         WHERE account_id = $2
+           AND status = 'sending'
+           AND updated_at < $1 - 300
+           AND id NOT IN (SELECT id FROM finalize_delivered)
+         RETURNING id
        ),
        claimed AS (
          UPDATE outbox
@@ -1576,43 +1585,67 @@ async function handleSendOutbox(outboxId: number, request: Request, env: Env, ac
   }
 }
 
-async function handleAckOutbox(outboxId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+export async function handleAckOutbox(outboxId: number, request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
 
   const b = body as Record<string, unknown>;
   const status = b.status as string;
-  if (!['sent', 'failed', 'partial'].includes(status)) {
-    return json({ ok: false, error: 'status must be sent, failed, or partial' }, 400);
+  // W3 (#107/#108): 'sending' is a progress ack — it records per-recipient
+  // results (incl. sent ids) and refreshes the claim timestamp so a long mass
+  // send is never "stuck"-reset mid-flight, but never finalizes the item.
+  if (!['sent', 'failed', 'partial', 'sending'].includes(status)) {
+    return json({ ok: false, error: 'status must be sent, failed, partial, or sending' }, 400);
   }
 
   const now = Math.floor(Date.now() / 1000);
   const sentAt = typeof b.sent_at === 'number' ? b.sent_at : now;
   const error = typeof b.error === 'string' ? b.error : null;
+  const sentMessageId = typeof b.sent_message_id === 'string' ? b.sent_message_id : null;
 
   const sql = getSql(env);
   try {
-    await sql(
-      `UPDATE outbox SET status = $1, sent_at = $2, error = $3, updated_at = $4
-       WHERE account_id = $5 AND id = $6`,
-      [status, sentAt, error, now, accountId, outboxId],
-    );
+    // W3 (#108): the ack respects the claim. Terminal acks land only while the
+    // item is 'sending' (the listener's claim) or 'needs_review' (an operator
+    // resolving a parked item); progress acks only while 'sending'. A late or
+    // racing ack can no longer flip an unrelated status.
+    const rows = await sql(
+      `UPDATE outbox
+       SET status = CASE WHEN $1 = 'sending' THEN status ELSE $1 END,
+           sent_at = CASE WHEN $1 = 'sending' THEN sent_at ELSE $2 END,
+           error = CASE WHEN $1 = 'sending' THEN error ELSE $3 END,
+           sent_message_id = COALESCE($4, sent_message_id),
+           updated_at = $5
+       WHERE account_id = $6 AND id = $7
+         AND ( ($1 = 'sending' AND status = 'sending')
+            OR ($1 != 'sending' AND status IN ('sending','needs_review')) )
+       RETURNING id, status`,
+      [status, sentAt, error, sentMessageId, now, accountId, outboxId],
+    ) as Array<{ id: number; status: string }>;
+    if (rows.length === 0) {
+      return json({ ok: false, error: 'outbox item not found or not in a claimable state' }, 409);
+    }
 
-    // Update per-recipient results if provided
+    // Update per-recipient results if provided. NOTE: ids arrive as numeric
+    // strings in practice (the pg/Neon drivers serialize BIGINT as string),
+    // and the old typeof-number check silently discarded every update.
     const results = Array.isArray(b.results) ? (b.results as Array<Record<string, unknown>>) : null;
     if (results && results.length > 0) {
       for (const r of results) {
-        if (typeof r.id !== 'number') continue;
+        const rid = typeof r.id === 'number'
+          ? r.id
+          : typeof r.id === 'string' && /^\d+$/.test(r.id) ? Number(r.id) : null;
+        if (rid === null) continue;
         await sql(
-          `UPDATE outbox_recipients SET status = $1, sent_at = $2, error = $3
-           WHERE id = $4 AND outbox_id = $5`,
-          [r.status ?? 'sent', r.sent_at ?? now, r.error ?? null, r.id, outboxId],
+          `UPDATE outbox_recipients SET status = $1, sent_at = $2, error = $3, sent_message_id = COALESCE($4, sent_message_id)
+           WHERE id = $5 AND outbox_id = $6`,
+          [r.status ?? 'sent', r.sent_at ?? now, r.error ?? null, typeof r.sent_message_id === 'string' ? r.sent_message_id : null, rid, outboxId],
         );
       }
     }
 
     console.log(`[POST /outbox/${outboxId}/ack] account=${accountId} status=${status}`);
-    return json({ ok: true });
+    return json({ ok: true, status: rows[0]!.status });
   } catch (err) {
     console.error('[POST /outbox/:id/ack] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -1665,15 +1698,37 @@ async function handlePostAction(request: Request, env: Env, accountId: string, a
   }
 }
 
-async function handleGetActionsPending(_request: Request, env: Env, accountId: string): Promise<Response> {
+export async function handleGetActionsPending(_request: Request, env: Env, accountId: string): Promise<Response> {
+  const now = Math.floor(Date.now() / 1000);
   const sql = getSql(env);
   try {
+    // W3 (#109): claim-based handout. A single atomic CTE parks claims stuck
+    // >5 min ('needs_review' — a re-executed forward duplicates a message, so
+    // stuck claims are never auto-retried) and hands out pending rows by
+    // flipping them to 'sending' — two pollers can never receive the same row.
     const rows = await sql(
-      `SELECT id, action, tg_chat_id, tg_message_id, text, to_chat_id, created_at
-       FROM pending_actions
-       WHERE account_id = $1 AND status = 'pending'
-       ORDER BY created_at ASC`,
-      [accountId],
+      `WITH park_stuck AS (
+         UPDATE pending_actions
+         SET status = 'needs_review',
+             error = COALESCE(error, 'claim stuck >5min — parked, never auto-retried')
+         WHERE account_id = $1
+           AND status = 'sending'
+           AND claimed_at < $2 - 300
+         RETURNING id
+       ),
+       claimed AS (
+         UPDATE pending_actions
+         SET status = 'sending', claimed_at = $2
+         WHERE id IN (
+           SELECT id FROM pending_actions
+           WHERE account_id = $1 AND status = 'pending'
+           ORDER BY created_at ASC
+           LIMIT 10
+         )
+         RETURNING id, action, tg_chat_id, tg_message_id, text, to_chat_id, created_at
+       )
+       SELECT * FROM claimed`,
+      [accountId, now],
     );
     return json(rows);
   } catch (err) {
@@ -1682,7 +1737,7 @@ async function handleGetActionsPending(_request: Request, env: Env, accountId: s
   }
 }
 
-async function handleAckAction(actionId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+export async function handleAckAction(actionId: number, request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
 
@@ -1694,10 +1749,18 @@ async function handleAckAction(actionId: number, request: Request, env: Env, acc
 
   const sql = getSql(env);
   try {
-    await sql(
-      `UPDATE pending_actions SET status = $1, error = $2 WHERE account_id = $3 AND id = $4`,
+    // W3 (#109): the ack respects the claim — terminal acks land only from
+    // 'sending' (the listener) or 'needs_review' (an operator resolving a
+    // parked action).
+    const rows = await sql(
+      `UPDATE pending_actions SET status = $1, error = $2
+       WHERE account_id = $3 AND id = $4 AND status IN ('sending','needs_review')
+       RETURNING id`,
       [status, typeof b.error === 'string' ? b.error : null, accountId, actionId],
-    );
+    ) as Array<{ id: number }>;
+    if (rows.length === 0) {
+      return json({ ok: false, error: 'action not found or not claimed' }, 409);
+    }
     console.log(`[POST /actions/${actionId}/ack] account=${accountId} status=${status}`);
     return json({ ok: true });
   } catch (err) {
