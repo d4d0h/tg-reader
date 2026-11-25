@@ -3445,10 +3445,25 @@ async function fetch(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const isMcp = url.pathname === '/mcp';
+  // W4 (#113): POST /admin/backup triggers runBackup with rethrow, so the
+  // real failure surfaces as JSON instead of the swallowed catch that made
+  // the empty bucket invisible. Same admin token as /admin/migrate.
+  if (request.method === 'POST' && url.pathname === '/admin/backup') {
+    const token = request.headers.get('x-admin-token');
+    if (!env.ADMIN_MIGRATE_TOKEN || !token || token !== env.ADMIN_MIGRATE_TOKEN) {
+      return json({ ok: false, error: 'Unauthorized' }, 401);
+    }
+    try {
+      await runBackup(env, true);
+      return json({ ok: true });
+    } catch (err) {
+      return json({ ok: false, error: 'backup failed', detail: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }, 500);
+    }
+  }
 
   // For /mcp: the claude.ai connector dialog only supports a URL — no custom headers.
   // Fall back to ?token= and ?account_id= query params so connector URLs keep working.
+  const isMcp = url.pathname === '/mcp';
   const tokenOverride = isMcp ? url.searchParams.get('token') : null;
   const accountIdOverride = isMcp ? url.searchParams.get('account_id') : null;
 
@@ -3520,7 +3535,7 @@ async function* streamMessages(sql: NeonQueryFunction<false, false>): AsyncGener
   }
 }
 
-async function runBackup(env: Env): Promise<void> {
+async function runBackup(env: Env, rethrow = false): Promise<{ ok: boolean; error: string }> {
   const date = new Date().toISOString().slice(0, 10);
   const key = `backup-${date}.ndjson`;
   const sql = getSql(env);
@@ -3570,7 +3585,10 @@ async function runBackup(env: Env): Promise<void> {
     }
   } catch (err) {
     console.error('[backup] failed', err);
+    if (rethrow) throw err;
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+  return { ok: true, error: '' };
 }
 
 async function runStorageCheck(env: Env): Promise<void> {
