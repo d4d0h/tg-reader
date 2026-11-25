@@ -3540,50 +3540,57 @@ async function runBackup(env: Env, rethrow = false): Promise<{ ok: boolean; erro
   const key = `backup-${date}.ndjson`;
   const sql = getSql(env);
 
-  try {
-    const encoder = new TextEncoder();
-    let rowCount = 0;
+  // W4 (#113) root-cause fix: R2 put() rejects a ReadableStream without a
+  // known length ("Provided readable stream must have a known length") — the
+  // reason every nightly backup failed silently. A full dump is ~300MB, too
+  // big to buffer whole, so stream batches into R2 multipart parts.
+  const encoder = new TextEncoder();
+  const FLUSH_AT = 10 * 1024 * 1024; // per-part cap, clears R2's 5MiB minimum
+  const state: { upload: R2MultipartUpload | null } = { upload: null };
+  const parts: R2UploadedPart[] = [];
+  const buffer = new Uint8Array(FLUSH_AT);
+  let bufferedBytes = 0;
+  let rowCount = 0;
 
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const line of streamMessages(sql)) {
-            controller.enqueue(encoder.encode(line));
-            rowCount++;
-          }
-          controller.close();
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-    });
-
-    await env.BACKUP_BUCKET.put(key, stream, {
-      httpMetadata: { contentType: 'application/x-ndjson' },
-    });
-    console.log(`[backup] uploaded key=${key} rows=${rowCount}`);
-
-    // Delete R2 backup objects older than 30 days.
-    // Keys are backup-YYYY-MM-DD.ndjson — lexicographic order == date order.
-    const cutoffKey = `backup-${new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10)}.ndjson`;
-    const listed = await env.BACKUP_BUCKET.list({ prefix: 'backup-' });
-    const toDelete = listed.objects.filter(o => o.key < cutoffKey).map(o => o.key);
-    for (const oldKey of toDelete) {
-      await env.BACKUP_BUCKET.delete(oldKey);
-      console.log(`[backup] deleted old backup key=${oldKey}`);
+  const flushPart = async (): Promise<void> => {
+    if (bufferedBytes === 0) return;
+    if (!state.upload) {
+      state.upload = await env.BACKUP_BUCKET.createMultipartUpload(key, {
+        httpMetadata: { contentType: 'application/x-ndjson' },
+      });
     }
+    const part = await state.upload.uploadPart(partNumber, buffer.subarray(0, bufferedBytes));
+    parts.push({ partNumber, etag: part.etag });
+    partNumber++;
+    bufferedBytes = 0;
+  };
 
-    // Prune old audit_log rows per configured retention policy
-    const now = Math.floor(Date.now() / 1000);
-    const retentionRows = await sql(
-      `SELECT value FROM global_config WHERE account_id = 'global' AND key = 'audit_log_retention_days'`,
-    ) as Array<{ value: string }>;
-    const days = parseInt(retentionRows[0]?.value ?? '90', 10);
-    if (days > 0) {
-      await sql(`DELETE FROM audit_log WHERE created_at < $1`, [now - days * 86400]);
-      console.log(`[backup] pruned audit_log older than ${days} days`);
+  let partNumber = 1;
+  try {
+    for await (const line of streamMessages(sql)) {
+      const bytes = encoder.encode(line);
+      if (bufferedBytes + bytes.byteLength > FLUSH_AT) {
+        await flushPart();
+      }
+      buffer.set(bytes, bufferedBytes);
+      bufferedBytes += bytes.byteLength;
+      rowCount++;
+    }
+    await flushPart();
+
+    if (!state.upload) {
+      // Archive fits in one part: no multipart needed, single put().
+      const body = buffer.subarray(0, bufferedBytes);
+      await env.BACKUP_BUCKET.put(key, body, {
+        httpMetadata: { contentType: 'application/x-ndjson' },
+      });
+      console.log(`[backup] uploaded key=${key} rows=${rowCount} (single)`);
+    } else {
+      await state.upload.complete(parts);
+      console.log(`[backup] uploaded key=${key} rows=${rowCount} parts=${parts.length}`);
     }
   } catch (err) {
+    if (state.upload) await state.upload.abort().catch(() => {});
     console.error('[backup] failed', err);
     if (rethrow) throw err;
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
