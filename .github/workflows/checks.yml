@@ -3,6 +3,7 @@ name: Checks
 on:
   pull_request:
   workflow_call:
+  workflow_dispatch:
 
 # Superseded runs on the same PR waste minutes — cancel them.
 concurrency:
