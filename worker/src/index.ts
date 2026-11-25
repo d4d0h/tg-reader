@@ -3543,14 +3543,17 @@ async function runBackup(env: Env, rethrow = false): Promise<{ ok: boolean; erro
   // W4 (#113) root-cause fix: R2 put() rejects a ReadableStream without a
   // known length ("Provided readable stream must have a known length") — the
   // reason every nightly backup failed silently. A full dump is ~300MB, too
-  // big to buffer whole, so stream batches into R2 multipart parts.
+  // big to buffer whole, so stream batches into R2 multipart parts. R2
+  // requires all non-trailing parts to be the SAME size: every full buffer
+  // flush uploads exactly FLUSH_AT bytes, and only the final flush is short.
   const encoder = new TextEncoder();
-  const FLUSH_AT = 10 * 1024 * 1024; // per-part cap, clears R2's 5MiB minimum
-  const state: { upload: R2MultipartUpload | null } = { upload: null };
-  const parts: R2UploadedPart[] = [];
+  const FLUSH_AT = 10 * 1024 * 1024;
   const buffer = new Uint8Array(FLUSH_AT);
   let bufferedBytes = 0;
   let rowCount = 0;
+  const state: { upload: R2MultipartUpload | null } = { upload: null };
+  const parts: R2UploadedPart[] = [];
+  let partNumber = 1;
 
   const flushPart = async (): Promise<void> => {
     if (bufferedBytes === 0) return;
@@ -3565,26 +3568,36 @@ async function runBackup(env: Env, rethrow = false): Promise<{ ok: boolean; erro
     bufferedBytes = 0;
   };
 
-  let partNumber = 1;
+  const appendBytes = async (bytes: Uint8Array): Promise<void> => {
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const take = Math.min(FLUSH_AT - bufferedBytes, bytes.byteLength - offset);
+      buffer.set(bytes.subarray(offset, offset + take), bufferedBytes);
+      bufferedBytes += take;
+      offset += take;
+      if (bufferedBytes === FLUSH_AT) await flushPart();
+    }
+  };
+
   try {
     for await (const line of streamMessages(sql)) {
-      const bytes = encoder.encode(line);
-      if (bufferedBytes + bytes.byteLength > FLUSH_AT) {
-        await flushPart();
-      }
-      buffer.set(bytes, bufferedBytes);
-      bufferedBytes += bytes.byteLength;
+      const bytes = encoder.encode(line + '\n');
+      await appendBytes(bytes);
       rowCount++;
     }
-    await flushPart();
+    await flushPart(); // trailing short part (or skipped when empty)
 
     if (!state.upload) {
-      // Archive fits in one part: no multipart needed, single put().
-      const body = buffer.subarray(0, bufferedBytes);
-      await env.BACKUP_BUCKET.put(key, body, {
-        httpMetadata: { contentType: 'application/x-ndjson' },
-      });
-      console.log(`[backup] uploaded key=${key} rows=${rowCount} (single)`);
+      // Nothing written at all (empty archive): skip.
+      console.log(`[backup] no rows to back up — key=${key} skipped`);
+    } else if (bufferedBytes > 0) {
+      // Can't happen after flushPart, kept for clarity.
+      await flushPart();
+    } else if (parts.length === 1) {
+      // Single full buffer: a plain put() on the already-uploaded part is not
+      // possible (it went up as a part), so complete the one-part upload.
+      await state.upload.complete(parts);
+      console.log(`[backup] uploaded key=${key} rows=${rowCount} (1 part)`);
     } else {
       await state.upload.complete(parts);
       console.log(`[backup] uploaded key=${key} rows=${rowCount} parts=${parts.length}`);
